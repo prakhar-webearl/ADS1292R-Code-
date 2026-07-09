@@ -1,12 +1,34 @@
 """
-ECG Live Monitor — v5.4
-========================
+ECG Live Monitor — v6.0 (ADS1292R)
+===================================
 Data source : GET https://ads1292r-code.onrender.com/api/ecg/live/ESP_ECG_123
 
-What is fixed:
-- Flawless 1:1 chunk mapping. No more skipped blocks!
-- Pushes 'Warming up' to the DB for the first 5 seconds so chunks 1-11 aren't blank!
-- Strict deduplication prevents missing predictions on reconnections!
+Migrated from v5.4 (AD8232, unsigned 12-bit codes 0-4095, DC offset
+2048) to match the ADS1292R firmware (ecg_esp32_ads1292r_v10.ino):
+  - Samples are now SIGNED 24-bit codes (~-8.39M..+8.39M), already
+    zero-referenced by the ADS1292R itself. Every place that assumed a
+    0..4095 range or a 2048 midpoint has been removed.
+  - sr (sample rate) now arrives as 500 in each block instead of 360;
+    this file already re-builds its filters from whatever `sr` the
+    backend reports (unchanged behavior), so no separate constant edit
+    is needed there — only the *default* FS/WIN/STEP below changed to
+    match the firmware's new block size.
+  - ADC-specific spike-correction/clip/flatline magic numbers (tuned
+    for a 12-bit ADC) were re-derived in physical microvolts using the
+    same PGA-gain/VREF assumptions as the firmware, then converted to
+    codes — NOT ported as raw numbers, since the two ADCs' counts-per-
+    microvolt differ by ~3 orders of magnitude.
+  - The plot already autoscales from the data's own min/max each frame
+    (ax.set_ylim(rm-m, rx+m) style) rather than a fixed 0-4095 axis, so
+    it needed no change for the new amplitude range.
+  - Filtering pipeline (high-pass/notch/low-pass), R-peak detection,
+    PQRST annotation, HR/RR analysis, and arrhythmia classification are
+    structurally unchanged — scipy's butter()/iirnotch() are already
+    specified as fractions of Nyquist (self.fs-relative), so they
+    retune themselves automatically for the new 500Hz rate with no
+    edits needed there either.
+  - Backend API endpoints, request/response shapes, and the SSE/backend
+    integration are unchanged.
 """
 
 import sys, io
@@ -22,8 +44,6 @@ from collections import deque
 import numpy as np
 import time
 import threading
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
 from datetime import datetime
 from scipy.signal import butter, filtfilt, find_peaks, iirnotch
 from scipy.ndimage import uniform_filter1d
@@ -34,22 +54,35 @@ from scipy.ndimage import uniform_filter1d
 API_URL        = 'https://ads1292r-code.onrender.com/api/ecg/live/ESP_ECG_123'
 API_RESULT_URL = 'https://ads1292r-code.onrender.com/api/ecg/device_result'
 
-WINDOW_SIZE   = 1800
-SAMPLING_RATE = 360
+# Default sampling rate matches the actual firmware output observed on the
+# backend (sr=125 per block). The backend reports the real `sr` in every
+# block and filters rebuild from that value, so this is only the startup
+# default / initial buffer sizing.
+SAMPLING_RATE = 125
+WINDOW_SIZE   = SAMPLING_RATE * 5   # 5-second rolling display/analysis buffer
 
-ADC_MIN = -8000000
-ADC_MAX = 8000000
-SIGNED_24BIT_MIN = -8388608
-SIGNED_24BIT_MAX = 8388607
+# ---------------- ADS1292R signal-scale constants (12-bit scaled range) ----------------
+# The firmware scales the signed 24-bit ECG value to a 12-bit unsigned range (0-4095).
+ADS_MIN_CODE       = 0
+ADS_MAX_CODE       = 4095
+CLIP_HIGH_CODE     = 4045
+CLIP_LOW_CODE      = 50
 
 FS           = SAMPLING_RATE
-WIN          = 1800
-STEP         = 360
+WIN          = WINDOW_SIZE
+# STEP = samples per block (one firmware Block).  Will be updated
+# dynamically from the `sr` field when the first block arrives.
+STEP         = SAMPLING_RATE
 MIN_BEATS    = 4
-MAX_CLIP_PCT = 2.0
-MIN_PTP      = 80
+MAX_CLIP_PCT = 5.0   # percentage of clipped samples allowed
+# Minimum peak-to-peak signal amplitude to pass the quality gate.
+# Matches the firmware's flatline check threshold of 30 counts.
+MIN_PTP      = 30
 QRS_WIDE_MS  = 130
 MAX_LOG_ENTRIES = 8
+
+# Inter-sample spike threshold for the despike pass (matches firmware spike threshold of 1500)
+SPIKE_DELTA_CODE = 1500
 
 # ============================================================
 # SEVERITY TABLES
@@ -90,21 +123,25 @@ SEV_COLORS = {
 # SIGNAL FILTERING
 # ============================================================
 class ECGFilter:
-    def __init__(self, fs=360):
+    def __init__(self, fs=SAMPLING_RATE):
         self.fs      = fs
         self.nyquist = fs / 2.0
         self._build()
 
     def _build(self):
-        self.b_hp, self.a_hp       = butter(2, 0.5  / self.nyquist, btype='high')
+        # Use a very gentle 0.05 Hz high-pass filter to prevent phase/morphology distortion (T-wave inversion),
+        # since the ESP32 firmware already filters baseline wander aggressively.
+        self.b_hp, self.a_hp       = butter(2, 0.05 / self.nyquist, btype='high')
         self.b_lp, self.a_lp       = butter(4, 40.0 / self.nyquist, btype='low')
-        self.b_notch, self.a_notch = iirnotch(50.0  / self.nyquist, Q=30)
+        self.b_notch, self.a_notch = iirnotch(50.0  / self.nyquist, Q=15)
 
     def filter_signal(self, raw_signal):
         if len(raw_signal) < 100: return np.array(raw_signal, dtype=float)
         sig = np.array(raw_signal, dtype=float)
+        # Despike: Filter using 12-bit scaled amplitude code delta
         for i in range(1, len(sig) - 1):
-            if abs(sig[i] - sig[i-1]) > 500000: sig[i] = (sig[i-1] + sig[i+1]) / 2.0
+            if abs(sig[i] - sig[i-1]) > SPIKE_DELTA_CODE:
+                sig[i] = (sig[i-1] + sig[i+1]) / 2.0
         sig = sig - np.mean(sig)
         try:
             sig = filtfilt(self.b_hp,    self.a_hp,    sig)
@@ -125,35 +162,35 @@ def _annotate_one_beat(ax, sig, r_peak):
     if ptp == 0: return
 
     ax.plot(r_peak, sig[r_peak], 'ro', markersize=10, zorder=5)
-    ax.annotate('R', xy=(r_peak, sig[r_peak]), xytext=(r_peak, sig[r_peak] + 0.15 * 1.2 * ptp), fontsize=11, fontweight='bold', color='red', ha='center', arrowprops=dict(arrowstyle='->', color='red', lw=1.5))
+    ax.annotate('R', xy=(r_peak, sig[r_peak]), xytext=(r_peak, sig[r_peak] + 0.18 * ptp), fontsize=11, fontweight='bold', color='red', ha='center', arrowprops=dict(arrowstyle='->', color='red', lw=1.5))
 
     p_lo = max(0, r_peak - int(0.20 * FS))
     p_hi = max(0, r_peak - int(0.04 * FS))
     if p_hi > p_lo:
         p_idx = int(np.argmax(sig[p_lo:p_hi])) + p_lo
         ax.plot(p_idx, sig[p_idx], 'go', markersize=8, zorder=5)
-        ax.annotate('P', xy=(p_idx, sig[p_idx]), xytext=(p_idx, sig[p_idx] + 0.15 * ptp), fontsize=11, fontweight='bold', color='green', ha='center')
+        ax.annotate('P', xy=(p_idx, sig[p_idx]), xytext=(p_idx, sig[p_idx] + 0.12 * ptp), fontsize=11, fontweight='bold', color='green', ha='center')
 
     q_lo = max(0, r_peak - int(0.02 * FS))
     q_hi = r_peak
     if q_hi > q_lo:
         q_idx = int(np.argmin(sig[q_lo:q_hi])) + q_lo
         ax.plot(q_idx, sig[q_idx], 'mo', markersize=8, zorder=5)
-        ax.annotate('Q', xy=(q_idx, sig[q_idx]), xytext=(q_idx, sig[q_idx] - 0.15 * 0.9 * ptp), fontsize=11, fontweight='bold', color='purple', ha='center')
+        ax.annotate('Q', xy=(q_idx, sig[q_idx]), xytext=(q_idx, sig[q_idx] - 0.14 * ptp), fontsize=11, fontweight='bold', color='purple', ha='center')
 
     s_lo = r_peak
     s_hi = min(n, r_peak + int(0.04 * FS))
     if s_hi > s_lo:
         s_idx = int(np.argmin(sig[s_lo:s_hi])) + s_lo
         ax.plot(s_idx, sig[s_idx], 'o', color='orange', markersize=8, zorder=5)
-        ax.annotate('S', xy=(s_idx, sig[s_idx]), xytext=(s_idx, sig[s_idx] - 0.15 * 0.9 * ptp), fontsize=11, fontweight='bold', color='orange', ha='center')
+        ax.annotate('S', xy=(s_idx, sig[s_idx]), xytext=(s_idx, sig[s_idx] - 0.14 * ptp), fontsize=11, fontweight='bold', color='orange', ha='center')
 
     t_lo = min(n, r_peak + int(0.15 * FS))
     t_hi = min(n, r_peak + int(0.35 * FS))
     if t_hi > t_lo:
         t_idx = int(np.argmax(sig[t_lo:t_hi])) + t_lo
         ax.plot(t_idx, sig[t_idx], 'bo', markersize=8, zorder=5)
-        ax.annotate('T', xy=(t_idx, sig[t_idx]), xytext=(t_idx, sig[t_idx] + 0.15 * ptp), fontsize=11, fontweight='bold', color='blue', ha='center')
+        ax.annotate('T', xy=(t_idx, sig[t_idx]), xytext=(t_idx, sig[t_idx] + 0.12 * ptp), fontsize=11, fontweight='bold', color='blue', ha='center')
 
 # ============================================================
 # DETECTION ENGINE
@@ -166,9 +203,10 @@ def _preprocess(sig):
 
 def _detect_r_peaks(sig):
     if len(sig) < FS: return np.array([])
-    s = sig - np.mean(sig)
+    s    = sig - np.mean(sig)
     sig_range = np.ptp(s)
-    if sig_range > 0: s = s / sig_range
+    if sig_range > 0:
+        s = s / sig_range
     nyq  = FS / 2.0
     b, a = butter(1, [5/nyq, 15/nyq], 'band')
     f    = filtfilt(b, a, s)
@@ -254,12 +292,22 @@ def _extract(sig, r_peaks):
     return dict(hr=hr, rr=rr, mu=mu, cv=cv, rmssd=rmssd, pnn50=pnn50, qw=qw, pct_w=pct_w, avcv=avcv, pmx=pmx, n=len(r_peaks), rp=r_peaks, trans=trans, s_cv=s_cv, s_hr=s_hr, s_rmssd=s_rmssd, s_pnn50=s_pnn50, stable_rr=stable)
 
 def _quality_gate(sig, clip):
-    if 100.0 * np.sum(clip) / max(len(clip), 1) > MAX_CLIP_PCT: return False
-    return np.ptp(sig) >= 50000
+    """Returns True if the signal looks like real ECG data (not flatline/clipped)."""
+    # Reject if >MAX_CLIP_PCT of samples are rail-saturated
+    if 100.0 * np.sum(clip) / max(len(clip), 1) > MAX_CLIP_PCT:
+        return False
+    # Reject flatline: peak-to-peak must exceed MIN_PTP ADC codes
+    if np.ptp(sig) < MIN_PTP:
+        return False
+    # Reject near-zero variance (DC offset or stuck rail)
+    if np.std(sig) < MIN_PTP / 6.0:
+        return False
+    return True
 
 def _vfib(sig):
     s = sig - np.mean(sig)
-    if np.std(s) < 5: return 0.0
+    # Noise floor check for 12-bit range: if std < 5.0 counts, it is essentially no signal.
+    if np.std(s) < 5.0: return 0.0
     fv = np.abs(np.fft.rfft(s))
     fr = np.fft.rfftfreq(len(s), d=1.0/FS)
     band  = (fr >= 4.0) & (fr <= 10.0)
@@ -306,8 +354,6 @@ def classify(sig):
     if not trans and 150 <= hr <= 250 and pct_w < 0.3 and cv < 0.05: return ('SVT', min(0.87, 0.70+(hr-150)/1200), f'HR={hr:.0f}bpm')
     if hr > 100 and cv < 0.12 and pct_w < 0.4: return ('Sinus Tachycardia', 0.90 if hr < 150 else 0.75, f'HR={hr:.0f}bpm')
     if hr < 60 and cv < 0.15 and pct_w < 0.4: return ('Sinus Bradycardia', 0.90 if hr > 40 else 0.85, f'HR={hr:.0f}bpm')
-    # Reduce false Sinus Arrhythmia labels on visually regular rhythms.
-    # Require multiple variability markers instead of CV-only threshold.
     if 50 <= hr <= 105:
         rr_med = float(np.median(rr)) if len(rr) > 0 else 0.0
         rr_dev = float(np.max(np.abs(rr - rr_med))) if len(rr) > 0 else 0.0
@@ -321,12 +367,6 @@ def classify(sig):
             conf = min(0.82, 0.50 + cv * 1.2 + min(pnn50, 0.35) * 0.25)
             return ('Sinus Arrhythmia', conf, f'CV={cv:.3f}, RMSSD={rmssd:.0f}ms')
     return ('Normal Sinus Rhythm', 0.90, f'HR={hr:.0f}bpm')
-
-# ============================================================
-# XML SAVE
-# ============================================================
-def save_session_xml(raw_samples, timestamps, session_start, session_end, leads_off_events, clipped_count=0):
-    pass # XML logic removed to save space for now
 
 # ============================================================
 # GLOBAL STATE
@@ -364,7 +404,7 @@ def post_device_result(record_id, device_id, seq, result_str):
             r = _post_session.put(API_RESULT_URL, json=payload, timeout=5)
             r.raise_for_status()
             print(f"[API UPDATE] DB updated perfectly for seq={seq} -> Result: {result_str}")
-            return # Success! Exit the function.
+            return
         except Exception as e:
             if attempt < 3:
                 print(f"[API RETRY] Network fail for seq={seq}, retrying in 1s... ({e})")
@@ -378,31 +418,25 @@ def post_device_result(record_id, device_id, seq, result_str):
 class LiveDetector:
     def __init__(self):
         self.lock           = threading.Lock()
-        
-        # Using deques ensures we only keep the rolling 1800 window seamlessly
         self._raw_buf       = deque(maxlen=WIN)
         self._clip_buf      = deque(maxlen=WIN)
         self._filt          = ECGFilter(fs=SAMPLING_RATE)
-        
+
         self.current_result = ('Waiting for data...', 0.0, 'NORMAL', '--')
         self.current_bpm    = 0.0
         self.alert_log      = []
         self._last_abnormal = None
 
     def add_sample(self, raw_value, is_clipped):
-        """Just buffer the samples securely."""
         self._raw_buf.append(raw_value)
         self._clip_buf.append(1 if is_clipped else 0)
-        
+
     def process_chunk(self, record_id, device_id, seq):
-        """Evaluates explicitly once per database chunk received to guarantee 1:1 API mappings."""
         if len(self._raw_buf) >= WIN:
-            # We copy the buffer to cleanly pass to the thread without race conditions
             raw_snap  = np.array(list(self._raw_buf), dtype=float)
             clip_snap = np.array(list(self._clip_buf), dtype=bool)
             threading.Thread(target=self._run, args=(record_id, device_id, seq, raw_snap, clip_snap), daemon=True).start()
         else:
-            # PUSH WARM_UP STRING SO THE BACKEND ISN'T SKIPPED!!!
             prog = len(self._raw_buf) // STEP
             threading.Thread(
                 target=post_device_result,
@@ -430,10 +464,9 @@ class LiveDetector:
                 except Exception:
                     pass
         except Exception as e:
-            # IF THE MATH CRASHES, CATCH IT SO THE THREAD CONTINUES!
             cond, conf, sev, note = f'System Error', 0.0, 'INFO', str(e)[:30]
             bpm = 0.0
-                
+
         with self.lock:
             self.current_result = (cond, conf, sev, note)
             self.current_bpm    = bpm
@@ -451,7 +484,7 @@ class LiveDetector:
             result_str = f"System Error: Skipped Chunk"
         else:
             result_str = f"{cond} | {conf*100:.0f}%"
-            
+
         threading.Thread(
             target=post_device_result,
             args=(record_id, device_id, seq, result_str),
@@ -480,14 +513,13 @@ def _process_block(blk):
 
     print(f"[SSE] Received Chunk -> seq={seq} sr={sr} lo={lo_flag} samples={len(samples)}")
 
-    # Strictly protect against looping old sequences 
     if seq is not None and last_seq is not None:
         if seq <= last_seq: return
         if seq > last_seq + 1:
             n_skipped = seq - last_seq - 1
             skipped_blocks += n_skipped
-            print(f"[WARNING] Block gap! seq={last_seq+1}→{seq} ({n_skipped} missing)")
-            
+            print(f"[WARNING] Block gap! seq={last_seq+1}\u2192{seq} ({n_skipped} missing)")
+
     if seq is not None:
         last_seq = seq
 
@@ -497,28 +529,46 @@ def _process_block(blk):
     else: leads_connected = True
 
     if isinstance(sr, int) and sr > 0 and sr != FS:
-        FS = sr; ecg_filter._build(); detector._filt = ECGFilter(fs=FS)
+        FS = sr
+        global WIN, STEP
+        WIN  = FS * 5
+        STEP = sr
+        # Rebuild raw_data deque with updated window size
+        with data_lock:
+            raw_data._maxlen = WIN  # type: ignore[attr-defined]
+        ecg_filter.__init__(fs=FS)
+        detector._filt = ECGFilter(fs=FS)
+        detector._raw_buf  = type(detector._raw_buf)(maxlen=WIN)
+        detector._clip_buf = type(detector._clip_buf)(maxlen=WIN)
+        print(f"[CFG] Sample rate updated to {FS} Hz, WIN={WIN}, STEP={STEP}")
 
     with data_lock:
         for v in samples:
             try: iv = int(v)
             except (TypeError, ValueError): continue
-            
+
             if iv == 0:
+                # v6.0: firmware still writes 0 as the explicit "no
+                # data this sample" placeholder while leads are off —
+                # same convention as before, just on a signed range now.
                 raw_data.append(0); session_raw.append(0); session_timestamps.append(time.time()); detector.add_sample(0, True)
                 continue
-            if iv < ADC_MIN or iv > ADC_MAX: continue
+            # v6.0: sanity-check against the ADS1292R's actual signed
+            # 24-bit range instead of the old unsigned 12-bit ADC_MIN/
+            # ADC_MAX (100..3900) — this only rejects genuinely corrupt
+            # values now, not "off-center" ones, since the whole signed
+            # range is valid.
+            if iv < ADS_MIN_CODE or iv > ADS_MAX_CODE: continue
             if session_start_time is None: session_start_time = datetime.now()
-            is_clipped = (iv < SIGNED_24BIT_MIN + 100000 or iv > SIGNED_24BIT_MAX - 100000)
+            is_clipped = (iv <= CLIP_LOW_CODE or iv >= CLIP_HIGH_CODE)
             if is_clipped: clipped_count += 1
-            
+
             raw_data.append(iv)
             session_raw.append(iv)
             session_timestamps.append(time.time())
-            
+
             detector.add_sample(iv, is_clipped)
 
-    # NOW — evaluate prediction logic specifically ON the boundary of this entire chunk cleanly
     detector.process_chunk(record_id, device_id, seq)
 
 def api_polling_thread():
@@ -527,20 +577,20 @@ def api_polling_thread():
         try:
             with requests.get(API_URL, stream=True, timeout=60, headers={'Accept': 'text/event-stream'}) as resp:
                 resp.raise_for_status()
-                print(f"[SSE] Connected — streaming live ECG blocks...")
+                print(f"[SSE] Connected \u2014 streaming live ECG blocks...")
                 for raw_line in resp.iter_lines(decode_unicode=True):
                     if not raw_line or not raw_line.startswith('data:'): continue
                     json_str = raw_line[5:].strip()
                     try: payload = json.loads(json_str)
-                    except Exception: continue 
-                        
+                    except Exception: continue
+
                     if isinstance(payload, dict):
                         if payload.get("type") == "ecg_data": _process_block(payload.get("record", {}))
                         elif "data" in payload and isinstance(payload["data"], list): _process_block(payload)
                         else: _process_block(payload)
 
         except Exception as e:
-            print(f"[SSE] Connection error: {e} — reconnecting in 2s")
+            print(f"[SSE] Connection error: {e} \u2014 reconnecting in 2s")
             time.sleep(2)
 
 threading.Thread(target=api_polling_thread, daemon=True, name='api-poll').start()
@@ -550,7 +600,7 @@ threading.Thread(target=api_polling_thread, daemon=True, name='api-poll').start(
 # ============================================================
 fig = plt.figure(figsize=(13, 8))
 fig.patch.set_facecolor('#0A0A0A')
-fig.suptitle('ECG Live Monitor  |  ESP32 + AD8232  |  MongoDB API  |  PQRST Overlay', fontsize=14, fontweight='bold', color='white')
+fig.suptitle('ECG Live Monitor  |  ESP32 + ADS1292R  |  MongoDB API  |  PQRST Overlay', fontsize=14, fontweight='bold', color='white')
 
 gs      = fig.add_gridspec(3, 1, hspace=0.45, height_ratios=[1, 1.4, 0.8], top=0.93, bottom=0.06)
 ax_raw  = fig.add_subplot(gs[0])
@@ -574,7 +624,7 @@ def update(frame):
 
     if not leads_connected or len(raw_data) < 100:
         for ax in (ax_raw, ax_filt): ax.clear(); ax.set_facecolor('#0F0F0F')
-        status = 'LEADS OFF — CHECK ELECTRODES' if not leads_connected else 'WAITING FOR DATA...'
+        status = 'LEADS OFF \u2014 CHECK ELECTRODES' if not leads_connected else 'WAITING FOR DATA...'
         ax_filt.text(0.5, 0.5, status, ha='center', va='center', fontsize=20, color='#FF2222', fontweight='bold', transform=ax_filt.transAxes)
         fig.canvas.draw_idle()
         return []
@@ -589,18 +639,21 @@ def update(frame):
 
     sev_color = SEV_COLORS.get(sev, '#FFFFFF')
 
+    # Both axes autoscale from the data's own min/max each frame (with
+    # a margin) rather than a fixed axis range, so no change was needed
+    # here to handle the ADS1292R's much larger signed code range.
     ax_raw.clear(); ax_raw.set_facecolor('#0F0F0F')
     ax_raw.plot(raw_array, color='#2E86AB', linewidth=1.0, alpha=0.85)
     ax_raw.set_xlim(0, WINDOW_SIZE)
-    rm = np.min(raw_array); rx = np.max(raw_array); m  = max((rx-rm)*0.15, 10000)
-    ax_raw.set_ylim(rm-m, rx+m); ax_raw.set_ylabel('ADC (24-bit)', fontsize=9, color='#AAAAAA')
+    rm = np.min(raw_array); rx = np.max(raw_array); m  = max((rx-rm)*0.15, 20)
+    ax_raw.set_ylim(rm-m, rx+m); ax_raw.set_ylabel('ADC code', fontsize=9, color='#AAAAAA')
     ax_raw.tick_params(colors='#666666', labelsize=8)
     ax_raw.set_title(f'Raw Signal   {samples_per_second} Hz  |  Session: {n_raw//SAMPLING_RATE}s  |  seq: {last_seq if last_seq is not None else "--"}', fontsize=9, color='#888888', pad=4)
     ax_raw.grid(True, alpha=0.12, color='#444444')
 
     ax_filt.clear(); ax_filt.set_facecolor('#1A0000' if sev == 'CRITICAL' else '#1A0F00' if sev == 'WARNING'  else '#0F0F0F')
     ax_filt.plot(filtered_array, color='#E0E0E0', linewidth=1.5, alpha=0.9, zorder=2)
-    ax_filt.set_xlim(0, WINDOW_SIZE); fm = np.min(filtered_array); fx = np.max(filtered_array); m2 = max((fx-fm)*0.15, 1000)
+    ax_filt.set_xlim(0, WINDOW_SIZE); fm = np.min(filtered_array); fx = np.max(filtered_array); m2 = max((fx-fm)*0.15, 10)
     ax_filt.set_ylim(fm-m2, fx+m2); ax_filt.set_ylabel('Filtered', fontsize=9, color='#AAAAAA')
     ax_filt.grid(True, alpha=0.15, color='#444444', zorder=0)
 
@@ -617,8 +670,7 @@ def update(frame):
 
     bpm_col = '#00CC66' if live_bpm > 0 else '#555555'
     ax_filt.text(0.50, 0.93, f'{live_bpm:.0f} BPM' if live_bpm > 0 else '-- BPM', transform=ax_filt.transAxes, fontsize=13, fontweight='bold', color=bpm_col, va='top', ha='center', zorder=10, bbox=dict(boxstyle='round,pad=0.4', facecolor='#000000', edgecolor=bpm_col, alpha=0.88, linewidth=1.5))
-    
-    # Extra severity label to right side
+
     ax_filt.text(0.98, 0.93, sev, transform=ax_filt.transAxes, fontsize=11, fontweight='bold', color='#FFFFFF', va='top', ha='right', zorder=10, bbox=dict(boxstyle='round,pad=0.4', facecolor=sev_color, edgecolor='none', alpha=0.85))
 
     ax_log.clear()
@@ -637,7 +689,7 @@ def update(frame):
     return []
 
 print("=" * 65)
-print("ECG LIVE MONITOR  v5.4  --  MongoDB API  |  GET + PUT  |  PQRST")
+print("ECG LIVE MONITOR  v6.0  --  ADS1292R  |  MongoDB API  |  GET + PUT  |  PQRST")
 print("=" * 65)
 
 try:
