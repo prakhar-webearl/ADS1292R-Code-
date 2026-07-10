@@ -82,7 +82,7 @@ QRS_WIDE_MS  = 130
 MAX_LOG_ENTRIES = 8
 
 # Inter-sample spike threshold for the despike pass (matches firmware spike threshold of 1500)
-SPIKE_DELTA_CODE = 1500
+SPIKE_DELTA_CODE = 2000000  # CHANGED: 2 million is safe for 24-bit spikes
 
 # ============================================================
 # SEVERITY TABLES
@@ -125,23 +125,29 @@ SEV_COLORS = {
 class ECGFilter:
     def __init__(self, fs=SAMPLING_RATE):
         self.fs = fs
-        # No need to build linear filters; ESP32 already handles baseline, notch, and LP
-        self.b_hp, self.a_hp = [1.0], [1.0]
-        self.b_lp, self.a_lp = [1.0], [1.0]
-        self.b_notch, self.a_notch = [1.0], [1.0]
+        self.nyquist = fs / 2.0
+        # 1. 0.5Hz High-pass: ONLY removes DC drift/baseline wander (Gentle)
+        self.b_hp, self.a_hp = butter(2, 0.5 / self.nyquist, btype='high')
+        # 2. 50Hz Notch: ONLY removes mains interference (Q=2 to avoid ringing)
+        self.b_notch, self.a_notch = iirnotch(50.0 / self.nyquist, Q=2)
+        # 3. REMOVED 40Hz Low-pass: It was smoothing the QRS too much, making it look overfiltered.
 
     def filter_signal(self, raw_signal):
         if len(raw_signal) < 100: return np.array(raw_signal, dtype=float)
         sig = np.array(raw_signal, dtype=float)
         
-        # 1. Keep only the median spike filter (catches SPI glitches)
+        # 1. Median spike filter (Catches SPI glitches)
         for i in range(1, len(sig) - 1):
             if abs(sig[i] - sig[i-1]) > SPIKE_DELTA_CODE:
                 sig[i] = (sig[i-1] + sig[i+1]) / 2.0
                 
-        # 2. DO NOT apply high-pass, notch, or low-pass. 
-        # The ESP32 already filtered this perfectly. 
-        # Applying extra filters flattens the T-wave and distorts the ST segment.
+        # 2. Apply High-pass for baseline and Notch for 50Hz noise (Removed Low-pass!)
+        try:
+            sig = filtfilt(self.b_hp,    self.a_hp,    sig)  # Remove baseline wander ONLY
+            sig = filtfilt(self.b_notch, self.a_notch, sig) # Remove 50Hz mains hum
+        except Exception:
+            pass
+                
         return sig
 
 
@@ -307,15 +313,18 @@ def _extract(sig, r_peaks):
     return dict(hr=hr, rr=rr, mu=mu, cv=cv, rmssd=rmssd, pnn50=pnn50, qw=qw, pct_w=pct_w, avcv=avcv, pmx=pmx, n=len(r_peaks), rp=r_peaks, trans=trans, s_cv=s_cv, s_hr=s_hr, s_rmssd=s_rmssd, s_pnn50=s_pnn50, stable_rr=stable)
 
 def _quality_gate(sig, clip):
-    """Returns True if the signal looks like real ECG data (not flatline/clipped)."""
-    # Reject if >MAX_CLIP_PCT of samples are rail-saturated
-    if 100.0 * np.sum(clip) / max(len(clip), 1) > MAX_CLIP_PCT:
+    clip_calc = (sig <= 50) | (sig >= 4045)
+    clip_pct = 100.0 * np.sum(clip_calc) / max(len(sig), 1)
+    if clip_pct > MAX_CLIP_PCT:
+        print(f"[DEBUG] Quality Gate Failed: {clip_pct:.1f}% clipping > {MAX_CLIP_PCT}%")
         return False
-    # Reject flatline: peak-to-peak must exceed MIN_PTP ADC codes
-    if np.ptp(sig) < MIN_PTP:
+    ptp = np.ptp(sig)
+    if ptp < MIN_PTP:
+        print(f"[DEBUG] Quality Gate Failed: PTP {ptp:.1f} < {MIN_PTP}")
         return False
-    # Reject near-zero variance (DC offset or stuck rail)
-    if np.std(sig) < MIN_PTP / 6.0:
+    std = np.std(sig)
+    if std < MIN_PTP / 6.0:
+        print(f"[DEBUG] Quality Gate Failed: Std {std:.1f} < {MIN_PTP/6.0}")
         return False
     return True
 
@@ -470,7 +479,9 @@ class LiveDetector:
 
     def _run(self, record_id, device_id, seq, raw_snap, clip_snap, drop_snap):
         try:
-            filtered  = self._filt.filter_signal(raw_snap)
+            # NEW: Rescale and clip raw 24-bit counts back to the 0-4095 scale for AI detection
+            rescaled_for_ai = np.clip((raw_snap / 64.0) + 2048, 0, 4095)
+            filtered  = self._filt.filter_signal(rescaled_for_ai)
             bpm = 0.0
             dropout_pct = 100.0 * np.sum(drop_snap) / max(len(drop_snap), 1)
             if dropout_pct > 2.0:
@@ -481,9 +492,11 @@ class LiveDetector:
                 result = classify(filtered)
                 if result is None:
                     cond, conf, sev, note = 'Insufficient beats', 0.0, 'INFO', 'Need more data'
+                    print(f"[DEBUG] classify returned None")
                 else:
                     cond, conf, note = result
                     sev = SEVERITY.get(cond, 'INFO')
+                    print(f"[DEBUG] classify returned: {cond}, {sev}, {conf}")
                 try:
                     rp = _detect_r_peaks(_preprocess(filtered))
                     if len(rp) >= 2:
@@ -595,7 +608,7 @@ def _process_block(blk):
             # ADC_MAX (100..3900) — this only rejects genuinely corrupt
             # values now, not "off-center" ones, since the whole signed
             # range is valid.
-            if iv < ADS_MIN_CODE or iv > ADS_MAX_CODE: continue
+            # DELETED: removed the ADC range check because we now send raw 24-bit data
             if session_start_time is None: session_start_time = datetime.now()
             is_clipped = (iv <= CLIP_LOW_CODE or iv >= CLIP_HIGH_CODE)
             if is_clipped: clipped_count += 1
@@ -671,7 +684,10 @@ def update(frame):
         return []
 
     with data_lock: raw_array = np.array(list(raw_data))
-    filtered_array = ecg_filter.filter_signal(raw_array)
+    
+    # RESCALE raw 24-bit to 0-4095 for the filtered graph (so Y-axis stays within 0-4095)
+    raw_visual_scaled = np.clip((raw_array / 64.0) + 2048, 0, 4095)
+    filtered_array = ecg_filter.filter_signal(raw_visual_scaled)
     
     with detector.lock:
         cond, conf, sev, note = detector.current_result
@@ -687,7 +703,7 @@ def update(frame):
     ax_raw.plot(raw_array, color='#2E86AB', linewidth=1.0, alpha=0.85)
     ax_raw.set_xlim(0, WINDOW_SIZE)
     rm = np.min(raw_array); rx = np.max(raw_array); m  = max((rx-rm)*0.15, 20)
-    ax_raw.set_ylim(rm-m, rx+m); ax_raw.set_ylabel('ADC code', fontsize=9, color='#AAAAAA')
+    ax_raw.set_ylim(rm-m, rx+m); ax_raw.set_ylabel('Raw 24-bit Counts', fontsize=9, color='#AAAAAA')  # UPDATED LABEL
     ax_raw.tick_params(colors='#666666', labelsize=8)
     ax_raw.set_title(f'Raw Signal   {samples_per_second} Hz  |  Session: {n_raw//SAMPLING_RATE}s  |  seq: {last_seq if last_seq is not None else "--"}', fontsize=9, color='#888888', pad=4)
     ax_raw.grid(True, alpha=0.12, color='#444444')
@@ -695,7 +711,7 @@ def update(frame):
     ax_filt.clear(); ax_filt.set_facecolor('#1A0000' if sev == 'CRITICAL' else '#1A0F00' if sev == 'WARNING'  else '#0F0F0F')
     ax_filt.plot(filtered_array, color='#E0E0E0', linewidth=1.5, alpha=0.9, zorder=2)
     ax_filt.set_xlim(0, WINDOW_SIZE); fm = np.min(filtered_array); fx = np.max(filtered_array); m2 = max((fx-fm)*0.15, 10)
-    ax_filt.set_ylim(fm-m2, fx+m2); ax_filt.set_ylabel('Filtered', fontsize=9, color='#AAAAAA')
+    ax_filt.set_ylim(-500, 4500); ax_filt.set_ylabel('Filtered', fontsize=9, color='#AAAAAA')  # Forces the graph to show a clean 12-bit ECG scale
     ax_filt.grid(True, alpha=0.15, color='#444444', zorder=0)
 
     try:

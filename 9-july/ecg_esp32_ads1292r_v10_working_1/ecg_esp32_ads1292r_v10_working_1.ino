@@ -1,5 +1,5 @@
 /*
-final test
+final test with conformation  hhh
  * ESP32 ECG v10.1 — ADS1292R Migration (Full)
  * (v9.x: all previous AD8232 pipeline versions — see original header)
  *  v10.1: Moved syncUserIdFromBackend to core 0 task to prevent DRDY polling stall.
@@ -172,7 +172,7 @@ WiFiClientSecure client;
 HTTPClient http;
 
 struct Block {
-  uint16_t data[WINDOW_SIZE];
+  int32_t data[WINDOW_SIZE];  // CHANGED
   uint32_t seq;
   bool lo;
   bool loPlus;   // v9.5: RA (LO+) electrode disconnected this block
@@ -192,9 +192,9 @@ struct WaveMeasurement {
   float timeMsFromR;  // negative = before R (P), positive = after R (T)
 };
 
-uint16_t buffers[2][WINDOW_SIZE];
-uint16_t analysisWindow[ANALYSIS_WINDOW_SIZE];
-uint16_t analysisSnapshot[ANALYSIS_WINDOW_SIZE];
+int32_t buffers[2][WINDOW_SIZE];  // CHANGED
+int32_t analysisWindow[ANALYSIS_WINDOW_SIZE];
+int32_t analysisSnapshot[ANALYSIS_WINDOW_SIZE];
 float analysisCentered[ANALYSIS_WINDOW_SIZE];
 
 volatile int activeBuffer = 0;
@@ -253,7 +253,7 @@ static bool notch_initialized = false;
 #define LP_MOVING_AVG_WIN 3
 
 // --------- Median (spike) filter state
-static uint16_t median_prev1 = 2048;
+static int32_t median_prev1 = 2048;
 
 // --------- Baseline wander removal (two-stage median) state ---------
 // A linear high-pass filter reacts to the sharp QRS transient like an
@@ -508,7 +508,7 @@ void handlePowerButton() {
 // ADS1292R's native 125 SPS rate — SAMPLE_RATE redefined below).
 void processNewSample(int32_t scaledValue) {
   portENTER_CRITICAL(&timerMux);
-  buffers[activeBuffer][sampleIndex] = (uint16_t)scaledValue;
+  buffers[activeBuffer][sampleIndex] = scaledValue;  // CHANGED (remove the cast)
   sampleIndex++;
   if (sampleIndex >= WINDOW_SIZE) {
     sampleIndex = 0;
@@ -1108,16 +1108,16 @@ void applyLowPassToBlock(float* data, int len) {
   movingAveragePass(temp, data, len);
 }
 
-void applyMedianToBlock(uint16_t* data, int len) {
-  uint16_t prev = median_prev1;
+void applyMedianToBlock(int32_t* data, int len) {
+  int32_t prev = median_prev1;
   for (int i = 0; i < len; i++) {
-    uint16_t cur  = data[i];
-    uint16_t next = (i < len - 1) ? data[i + 1] : cur;
-    uint16_t a = prev, b = cur, c = next;
+    int32_t cur  = data[i];
+    int32_t next = (i < len - 1) ? data[i + 1] : cur;
+    int32_t a = prev, b = cur, c = next;
     
-    if (a > b) { uint16_t t = a; a = b; b = t; }
-    if (b > c) { uint16_t t = b; b = c; c = t; }
-    if (a > b) { uint16_t t = a; a = b; b = t; }
+    if (a > b) { int32_t t = a; a = b; b = t; }
+    if (b > c) { int32_t t = b; b = c; c = t; }
+    if (a > b) { int32_t t = a; a = b; b = t; }
     
     prev = data[i];
     data[i] = b; 
@@ -1166,7 +1166,7 @@ void applySignalFiltersToBlock(Block& blk) {
 }
 
 
-bool copyAnalysisWindow(uint16_t* outSamples, uint32_t& sampleCount, uint32_t& latestSeq) {
+bool copyAnalysisWindow(int32_t* outSamples, uint32_t& sampleCount, uint32_t& latestSeq) {
   portENTER_CRITICAL(&analysisMux);
   sampleCount = analysisSampleCount;
   latestSeq = analysisLatestSeq;
@@ -1209,52 +1209,36 @@ String validationDetailText(const String& reason) {
   return "Check electrodes";
 }
 
-bool validateSamples(const uint16_t* samples, int sampleCount, String& reason) {
+bool validateSamples(const int32_t* samples, int sampleCount, String& reason) {
   reason = "";
 
-  uint16_t minV = UINT16_MAX;
-  uint16_t maxV = 0;
+  int32_t minV = 2147483647;
+  int32_t maxV = -2147483647 - 1;
   uint32_t zeroCount = 0;
   uint32_t clipCount = 0;
   uint32_t spikeCount = 0;
   
   for (int i = 0; i < sampleCount; i++) {
-    uint16_t value = samples[i];
-    // Zero samples = leads-off (DRDY ISR sets latestEcgValue=0 when off)
+    int32_t value = samples[i];
     if (value == 0) zeroCount++;
-    // Clip guard: ADS1292R output is centered at 2048 and very rarely
-    // reaches the rails after scaling. Widen the dead-band from the
-    // old 110/3890 (AD8232 rail) to 50/4045 so only true saturation
-    // (almost always a hardware fault, not a large QRS) is flagged.
-    if (value <= 50 || value >= 4045) clipCount++;
+    if (value <= -8388600 || value >= 8388600) clipCount++;
     if (value < minV) minV = value;
     if (value > maxV) maxV = value;
     if (i > 0) {
-      int delta = abs((int)value - (int)samples[i - 1]);
-      // Spike threshold: AD8232 value was 800 out of 4096 (≈20% full-scale).
-      // ADS1292R output has the same 0-4095 range after scaling, but the
-      // QRS itself can swing 200-500 counts per sample at 360 Hz during
-      // the steep R upstroke. 1500 (≈37% full-scale) flags only true
-      // glitches (bad SPI byte, electrostatic discharge) without
-      // incorrectly flagging a sharp but physiological QRS.
-      if (delta > 1500) spikeCount++;
+      int32_t delta = abs(value - samples[i - 1]);
+      if (delta > 2000000) spikeCount++;
     }
   }
 
   float zeroRatio = (float)zeroCount / (float)sampleCount;
   float clipRatio = (float)clipCount / (float)sampleCount;
-  uint16_t ptp = maxV - minV;
+  int32_t ptp = maxV - minV;
   
   if (zeroRatio > 0.15f) {
     reason = "TOO_MANY_ZERO_SAMPLES=" + String(zeroRatio, 2);
   } else if (clipRatio > 0.02f) {
     reason = "CLIPPED_SIGNAL=" + String(clipRatio, 2);
-  } else if (ptp < 30) {
-    // AD8232 threshold was 80 counts out of 4096 (≈2% FS).
-    // ADS1292R with gain=6 on a 1 mV ECG gives ~100-300 counts swing
-    // after our >>11 scaling. 30 counts (≈0.7% FS) is a better
-    // flatline guard: it still catches a stuck constant value without
-    // falsely flagging a real but small-amplitude ECG.
+  } else if (ptp < 2000) {
     reason = "LOW_AMPLITUDE=" + String(ptp);
   } else if (spikeCount > (sampleCount / 8)) {
     float spikeRatio = (float)spikeCount / (float)sampleCount;
@@ -1264,7 +1248,7 @@ bool validateSamples(const uint16_t* samples, int sampleCount, String& reason) {
   return reason.length() > 0;
 }
 
-int detectPeaks(const uint16_t* samples, int sampleCount, int* peaks, int maxPeaks, float& maxAbs) {
+int detectPeaks(const int32_t* samples, int sampleCount, int* peaks, int maxPeaks, float& maxAbs) {
   long sum = 0;
   for (int i = 0; i < sampleCount; i++) {
     sum += samples[i];
@@ -1309,7 +1293,7 @@ int detectPeaks(const uint16_t* samples, int sampleCount, int* peaks, int maxPea
   return peakCount;
 }
 
-float estimateQrsWidth(const uint16_t* samples, int sampleCount, int rIndex) {
+float estimateQrsWidth(const int32_t* samples, int sampleCount, int rIndex) {
   int searchRadius = (int)(0.07f * SAMPLE_RATE);
   int start = max(0, rIndex - searchRadius);
   int end = min(sampleCount - 1, rIndex + searchRadius);
@@ -1349,7 +1333,7 @@ float estimateQrsWidth(const uint16_t* samples, int sampleCount, int rIndex) {
 // searched before qOnsetIdx, T is searched after sOffsetIdx) so both
 // waves are located relative to this beat's real QRS boundaries rather
 // than a fixed offset from R.
-void findQrsBoundaries(const uint16_t* samples, int sampleCount, int rIndex, int& qOnsetIdx, int& sOffsetIdx) {
+void findQrsBoundaries(const int32_t* samples, int sampleCount, int rIndex, int& qOnsetIdx, int& sOffsetIdx) {
   int searchRadius = (int)(0.07f * SAMPLE_RATE);
   int start = max(0, rIndex - searchRadius);
   int end = min(sampleCount - 1, rIndex + searchRadius);
@@ -1380,7 +1364,7 @@ void findQrsBoundaries(const uint16_t* samples, int sampleCount, int rIndex, int
   sOffsetIdx = right;
 }
 
-static float localAverage(const uint16_t* samples, int sampleCount, int idx, int halfWin) {
+static float localAverage(const int32_t* samples, int sampleCount, int idx, int halfWin) {
   int lo = max(0, idx - halfWin);
   int hi = min(sampleCount - 1, idx + halfWin);
   float sum = 0.0f; int n = 0;
@@ -1388,7 +1372,7 @@ static float localAverage(const uint16_t* samples, int sampleCount, int idx, int
   return sum / (float)n;
 }
 
-static float measureIsoBaseline(const uint16_t* samples, int sampleCount, int rIndex) {
+static float measureIsoBaseline(const int32_t* samples, int sampleCount, int rIndex) {
   int idx = max(0, rIndex - (int)(0.28f * SAMPLE_RATE));  // TP segment, same anchor P-wave already uses
   return localAverage(samples, sampleCount, idx, 2);
 }
@@ -1399,7 +1383,7 @@ static float measureIsoBaseline(const uint16_t* samples, int sampleCount, int rI
 // search below). Window covers the normal PR-interval range (up to
 // 280ms before R) while stopping short of QRS onset so the QRS itself
 // is never mistaken for P.
-WaveMeasurement measurePWave(const uint16_t* samples, int sampleCount, int rIndex, int qOnsetIdx) {
+WaveMeasurement measurePWave(const int32_t* samples, int sampleCount, int rIndex, int qOnsetIdx) {
   WaveMeasurement m = {false, 0.0f, 0.0f};
 
   int winStart = max(0, rIndex - (int)(0.28f * SAMPLE_RATE));
@@ -1427,7 +1411,7 @@ WaveMeasurement measurePWave(const uint16_t* samples, int sampleCount, int rInde
 // largest deflection (either direction, so an inverted T is measured
 // correctly rather than missed). Window runs up to 440ms after R to
 // still catch a late T wave at slower heart rates.
-WaveMeasurement measureTWave(const uint16_t* samples, int sampleCount, int rIndex, int sOffsetIdx, float baselineIso) {
+WaveMeasurement measureTWave(const int32_t* samples, int sampleCount, int rIndex, int sOffsetIdx, float baselineIso) {
   WaveMeasurement m = {false, 0.0f, 0.0f};
 
   // Give the ST segment more room to settle before hunting for T --
@@ -1458,7 +1442,7 @@ WaveMeasurement measureTWave(const uint16_t* samples, int sampleCount, int rInde
   return m;
 }
 
-String classifyWindow(const uint16_t* samples, int sampleCount, String& severity, String& detail) {
+String classifyWindow(const int32_t* samples, int sampleCount, String& severity, String& detail) {
   severity = "";
   detail = "";
 
@@ -1752,7 +1736,15 @@ void sendTask(void* param) {
       String detail;
 
       if (copyAnalysisWindow(analysisSnapshot, sampleCount, latestSeq)) {
-        condition = classifyWindow(analysisSnapshot, ANALYSIS_WINDOW_SIZE, severity, detail);
+        // FIX: Rescale raw 24-bit data to 12-bit 0-4095 for ESP32 classifier
+        int32_t scaledSnapshot[ANALYSIS_WINDOW_SIZE];
+        for (int i = 0; i < ANALYSIS_WINDOW_SIZE; i++) {
+            int32_t val = (analysisSnapshot[i] >> 6) + 2048;
+            if (val > 4095) val = 4095;
+            if (val < 0) val = 0;
+            scaledSnapshot[i] = val;
+        }
+        condition = classifyWindow(scaledSnapshot, ANALYSIS_WINDOW_SIZE, severity, detail);
       } else {
         condition = "Warming up";
         severity = "INFO";
@@ -2170,9 +2162,7 @@ void loop() {
       dcBaseline += DC_TRACK_ALPHA * ((float)ecgRaw - dcBaseline);
       int32_t centered = ecgRaw - (int32_t)dcBaseline;
 
-      scaled = (centered >> 6) + 2048;
-      if (scaled > 4095) scaled = 4095;
-      if (scaled < 0)    scaled = 0;
+      scaled = centered;  // CHANGED: Send pure 24-bit counts
     } else {
       scaled = 0;
       dcBaselineInit = false;  // resync cleanly on lead reconnect
@@ -2201,7 +2191,7 @@ void loop() {
     portEXIT_CRITICAL(&ecgValueMux);
 
     Block blk;
-    memcpy(blk.data, buffers[sendBuf], WINDOW_SIZE * sizeof(uint16_t));
+    memcpy(blk.data, buffers[sendBuf], WINDOW_SIZE * sizeof(int32_t));  // CHANGED
     blk.seq = seqToSend;
     blk.lo = lo;
     blk.loPlus = loPlus;
@@ -2213,7 +2203,7 @@ void loop() {
     blk.deviceId[MAX_DEVICE_ID_LEN - 1] = '\0';
 
     // Apply baseline removal + 50Hz notch + 40Hz low-pass
-    applySignalFiltersToBlock(blk);
+    // applySignalFiltersToBlock(blk);  // <--- COMMENT THIS OUT! It corrupts int32_t raw data.
     appendAnalysisBlock(blk);
 
     if (xQueueSend(blockQueue, &blk, 0) != pdTRUE) {
