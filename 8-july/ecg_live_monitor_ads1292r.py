@@ -45,7 +45,7 @@ import numpy as np
 import time
 import threading
 from datetime import datetime
-from scipy.signal import butter, filtfilt, find_peaks, iirnotch
+from scipy.signal import butter, bessel, filtfilt, find_peaks, iirnotch
 from scipy.ndimage import uniform_filter1d
 
 # ============================================================
@@ -132,8 +132,12 @@ class ECGFilter:
         # Use a very gentle 0.05 Hz high-pass filter to prevent phase/morphology distortion (T-wave inversion),
         # since the ESP32 firmware already filters baseline wander aggressively.
         self.b_hp, self.a_hp       = butter(2, 0.05 / self.nyquist, btype='high')
-        self.b_lp, self.a_lp       = butter(4, 40.0 / self.nyquist, btype='low')
-        self.b_notch, self.a_notch = iirnotch(50.0  / self.nyquist, Q=15)
+        # Bessel instead of Butterworth: near-linear phase, minimal overshoot/
+        # ringing on sharp transients (the QRS spike). Stops the filter from
+        # creating a false undershoot right after R that reads as ST depression
+        # or an inverted T.
+        self.b_lp, self.a_lp       = bessel(3, 40.0 / self.nyquist, btype='low', norm='phase')
+        self.b_notch, self.a_notch = iirnotch(50.0 / self.nyquist, Q=6)
 
     def filter_signal(self, raw_signal):
         if len(raw_signal) < 100: return np.array(raw_signal, dtype=float)
@@ -160,6 +164,15 @@ def _annotate_one_beat(ax, sig, r_peak):
     n   = len(sig)
     ptp = np.ptp(sig)
     if ptp == 0: return
+
+    # True isoelectric baseline for THIS beat (PR/TP segment before it),
+    # not the filter's overall zero level — residual wander can leave a
+    # whole segment sitting off-zero even after filtering, which makes a
+    # normal T look inverted if measured against 0 instead of its own
+    # local baseline.
+    base_lo = max(0, r_peak - int(0.30 * FS))
+    base_hi = max(0, r_peak - int(0.22 * FS))
+    iso = float(np.mean(sig[base_lo:base_hi])) if base_hi > base_lo else 0.0
 
     ax.plot(r_peak, sig[r_peak], 'ro', markersize=10, zorder=5)
     ax.annotate('R', xy=(r_peak, sig[r_peak]), xytext=(r_peak, sig[r_peak] + 0.18 * ptp), fontsize=11, fontweight='bold', color='red', ha='center', arrowprops=dict(arrowstyle='->', color='red', lw=1.5))
@@ -189,8 +202,15 @@ def _annotate_one_beat(ax, sig, r_peak):
     t_hi = min(n, r_peak + int(0.35 * FS))
     if t_hi > t_lo:
         t_idx = int(np.argmax(sig[t_lo:t_hi])) + t_lo
-        ax.plot(t_idx, sig[t_idx], 'bo', markersize=8, zorder=5)
-        ax.annotate('T', xy=(t_idx, sig[t_idx]), xytext=(t_idx, sig[t_idx] + 0.12 * ptp), fontsize=11, fontweight='bold', color='blue', ha='center')
+        t_val = sig[t_idx]
+        t_dev = t_val - iso
+        t_inverted = t_dev < 0.05 * ptp          # still below/near baseline -> genuinely flat/inverted
+        t_color = '#3366FF' if not t_inverted else '#CC33FF'
+        t_label = 'T' if not t_inverted else 'T\u2193'
+        ax.plot(t_idx, t_val, 'o', color=t_color, markersize=8, zorder=5)
+        ax.annotate(t_label, xy=(t_idx, t_val),
+                    xytext=(t_idx, t_val + (0.12*ptp if not t_inverted else -0.12*ptp)),
+                    fontsize=11, fontweight='bold', color=t_color, ha='center')
 
 # ============================================================
 # DETECTION ENGINE
@@ -375,6 +395,10 @@ data_lock          = threading.Lock()
 raw_data           = deque(maxlen=WINDOW_SIZE)
 session_raw        = []
 session_timestamps = []
+RATE_WINDOW_SEC = 3.0
+recent_timestamps = deque(maxlen=2000)
+raw_dropout        = deque(maxlen=WINDOW_SIZE)   # parallel to raw_data: True = interpolated/dropout sample
+last_valid_sample  = 2048                        # ADS1292R pipeline baseline
 leads_off_events   = []
 session_start_time = None
 leads_connected    = True
@@ -420,22 +444,27 @@ class LiveDetector:
         self.lock           = threading.Lock()
         self._raw_buf       = deque(maxlen=WIN)
         self._clip_buf      = deque(maxlen=WIN)
+        self._drop_buf      = deque(maxlen=WIN)
         self._filt          = ECGFilter(fs=SAMPLING_RATE)
 
         self.current_result = ('Waiting for data...', 0.0, 'NORMAL', '--')
         self.current_bpm    = 0.0
         self.alert_log      = []
+        self._pending_cond  = None
+        self._pending_count = 0
         self._last_abnormal = None
 
-    def add_sample(self, raw_value, is_clipped):
+    def add_sample(self, raw_value, is_clipped, is_dropout=False):
         self._raw_buf.append(raw_value)
         self._clip_buf.append(1 if is_clipped else 0)
+        self._drop_buf.append(1 if is_dropout else 0)
 
     def process_chunk(self, record_id, device_id, seq):
         if len(self._raw_buf) >= WIN:
             raw_snap  = np.array(list(self._raw_buf), dtype=float)
             clip_snap = np.array(list(self._clip_buf), dtype=bool)
-            threading.Thread(target=self._run, args=(record_id, device_id, seq, raw_snap, clip_snap), daemon=True).start()
+            drop_snap = np.array(list(self._drop_buf), dtype=bool)
+            threading.Thread(target=self._run, args=(record_id, device_id, seq, raw_snap, clip_snap, drop_snap), daemon=True).start()
         else:
             prog = len(self._raw_buf) // STEP
             threading.Thread(
@@ -444,11 +473,14 @@ class LiveDetector:
                 daemon=True
             ).start()
 
-    def _run(self, record_id, device_id, seq, raw_snap, clip_snap):
+    def _run(self, record_id, device_id, seq, raw_snap, clip_snap, drop_snap):
         try:
             filtered  = self._filt.filter_signal(raw_snap)
             bpm = 0.0
-            if not _quality_gate(filtered, clip_snap):
+            dropout_pct = 100.0 * np.sum(drop_snap) / max(len(drop_snap), 1)
+            if dropout_pct > 2.0:
+                cond, conf, sev, note = 'Signal Dropout', 0.0, 'INFO', f'{dropout_pct:.1f}% samples lost — check electrode contact'
+            elif not _quality_gate(filtered, clip_snap):
                 cond, conf, sev, note = 'Poor signal quality', 0.0, 'INFO', 'Check electrodes'
             else:
                 result = classify(filtered)
@@ -471,11 +503,15 @@ class LiveDetector:
             self.current_result = (cond, conf, sev, note)
             self.current_bpm    = bpm
             is_abn = sev not in ('NORMAL', 'INFO')
-            if is_abn and cond != self._last_abnormal:
-                self.alert_log.append((datetime.now().strftime('%H:%M:%S'), cond, sev))
-                if len(self.alert_log) > MAX_LOG_ENTRIES: self.alert_log.pop(0)
-                self._last_abnormal = cond
-            elif not is_abn:
+            if is_abn:
+                if cond == self._pending_cond: self._pending_count += 1
+                else: self._pending_cond, self._pending_count = cond, 1
+                if self._pending_count >= 2 and cond != self._last_abnormal:
+                    self.alert_log.append((datetime.now().strftime('%H:%M:%S'), cond, sev))
+                    if len(self.alert_log) > MAX_LOG_ENTRIES: self.alert_log.pop(0)
+                    self._last_abnormal = cond
+            else:
+                self._pending_cond, self._pending_count = None, 0
                 self._last_abnormal = None
 
         if bpm > 0:
@@ -547,12 +583,18 @@ def _process_block(blk):
             try: iv = int(v)
             except (TypeError, ValueError): continue
 
+            global last_valid_sample
             if iv == 0:
-                # v6.0: firmware still writes 0 as the explicit "no
-                # data this sample" placeholder while leads are off —
-                # same convention as before, just on a signed range now.
-                raw_data.append(0); session_raw.append(0); session_timestamps.append(time.time()); detector.add_sample(0, True)
+                # Leads-off/dropout sample. Don't feed a false 0-code cliff into the
+                # plot or the filters — hold the last valid value, but flag it so the
+                # classifier can discount any RR gap that overlaps it.
+                hold = last_valid_sample
+                raw_data.append(hold); session_raw.append(hold); raw_dropout.append(True)
+                session_timestamps.append(time.time()); recent_timestamps.append(time.time())
+                detector.add_sample(hold, True, is_dropout=True)
                 continue
+            raw_dropout.append(False)
+            last_valid_sample = iv
             # v6.0: sanity-check against the ADS1292R's actual signed
             # 24-bit range instead of the old unsigned 12-bit ADC_MIN/
             # ADC_MAX (100..3900) — this only rejects genuinely corrupt
@@ -566,6 +608,7 @@ def _process_block(blk):
             raw_data.append(iv)
             session_raw.append(iv)
             session_timestamps.append(time.time())
+            recent_timestamps.append(time.time())
 
             detector.add_sample(iv, is_clipped)
 
@@ -616,11 +659,14 @@ def update(frame):
 
     with data_lock:
         n_raw = len(session_raw)
-        t0    = session_timestamps[0] if session_timestamps else None
+        now = time.time()
+        cutoff = now - RATE_WINDOW_SEC
+        recent_count = sum(1 for t in recent_timestamps if t >= cutoff)
+        oldest_recent = recent_timestamps[0] if recent_timestamps else now
 
-    if t0 and n_raw > 0:
-        dur = time.time() - t0
-        samples_per_second = int(n_raw / dur) if dur > 0 else 0
+    window_span = now - max(oldest_recent, cutoff)
+    if window_span >= 1.0:
+        samples_per_second = int(recent_count / window_span)
 
     if not leads_connected or len(raw_data) < 100:
         for ax in (ax_raw, ax_filt): ax.clear(); ax.set_facecolor('#0F0F0F')
