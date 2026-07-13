@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SWET IOT - Test Plotter (ECG & RESP)</title>
+    <!-- uPlot CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/uplot/dist/uPlot.min.css">
+    <style>
+        body { background-color: #121826; color: #E2E8F0; font-family: 'Inter', sans-serif; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: auto; }
+        .controls { display: flex; gap: 15px; margin-bottom: 20px; }
+        button { background: #3B82F6; color: white; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #2563EB; }
+        .btn-stop { background: #EF4444; }
+        .btn-stop:hover { background: #DC2626; }
+        .btn-pause { background: #F59E0B; }
+        .btn-pause:hover { background: #D97706; }
+        .chart-container { background: #1E293B; padding: 15px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .u-title { color: #fff !important; }
+        .u-legend { color: #fff !important; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>ADS1292R Raw Test Plotter (ECG & RESP)</h2>
+        <div class="controls">
+            <button id="btnConnect">Connect to ESP32 (COM)</button>
+            <button id="btnPause" class="btn-pause">Pause for Analysis</button>
+            <button id="btnClear" class="btn-stop">Clear Charts</button>
+            <span id="status" style="align-self: center; font-weight: bold; color: #10B981;">Disconnected</span>
+        </div>
+
+        <div class="chart-container">
+            <div id="ecgChart"></div>
+        </div>
+        
+        <div class="chart-container">
+            <div id="respChart"></div>
+        </div>
+    </div>
+
+    <!-- uPlot JS -->
+    <script src="https://unpkg.com/uplot/dist/uPlot.iife.min.js"></script>
+    <script>
+        const MAX_POINTS = 125 * 5; // 5 seconds at 125 SPS
+
+        let ecgData = [
+            Array(MAX_POINTS).fill(0).map((_, i) => i),
+            Array(MAX_POINTS).fill(0)
+        ];
+        
+        let respData = [
+            Array(MAX_POINTS).fill(0).map((_, i) => i),
+            Array(MAX_POINTS).fill(0)
+        ];
+
+        let sampleIndex = MAX_POINTS;
+
+        // ECG Chart
+        const ecgOpts = {
+            title: "Raw ECG Waveform",
+            width: 1150,
+            height: 300,
+            series: [
+                {},
+                {
+                    label: "ECG",
+                    stroke: "#10B981", // Green
+                    width: 2,
+                }
+            ],
+            axes: [
+                { stroke: "#64748B", grid: { stroke: "#334155" } },
+                { stroke: "#64748B", grid: { stroke: "#334155" } }
+            ]
+        };
+
+        // RESP Chart
+        const respOpts = {
+            title: "Raw Respiration Waveform",
+            width: 1150,
+            height: 300,
+            series: [
+                {},
+                {
+                    label: "RESP",
+                    stroke: "#3B82F6", // Blue
+                    width: 2,
+                }
+            ],
+            axes: [
+                { stroke: "#64748B", grid: { stroke: "#334155" } },
+                { stroke: "#64748B", grid: { stroke: "#334155" } }
+            ]
+        };
+
+        const ecgPlot = new uPlot(ecgOpts, ecgData, document.getElementById("ecgChart"));
+        const respPlot = new uPlot(respOpts, respData, document.getElementById("respChart"));
+
+        let port;
+        let reader;
+        let isPaused = false;
+        let buffer = "";
+
+        const btnConnect = document.getElementById("btnConnect");
+        const btnPause = document.getElementById("btnPause");
+        const btnClear = document.getElementById("btnClear");
+        const statusEl = document.getElementById("status");
+
+        btnConnect.addEventListener("click", async () => {
+            try {
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+                statusEl.innerText = "Connected & Streaming";
+                statusEl.style.color = "#3B82F6";
+                btnConnect.style.display = "none";
+                readLoop();
+                renderLoop();
+            } catch (err) {
+                console.error("Connection failed", err);
+                alert("Failed to connect to COM port.");
+            }
+        });
+
+        btnPause.addEventListener("click", () => {
+            isPaused = !isPaused;
+            btnPause.innerText = isPaused ? "Resume" : "Pause for Analysis";
+            statusEl.innerText = isPaused ? "Paused" : "Connected & Streaming";
+        });
+
+        btnClear.addEventListener("click", () => {
+            ecgData[0] = Array(MAX_POINTS).fill(0).map((_, i) => sampleIndex - MAX_POINTS + i);
+            ecgData[1] = Array(MAX_POINTS).fill(0);
+            respData[0] = Array(MAX_POINTS).fill(0).map((_, i) => sampleIndex - MAX_POINTS + i);
+            respData[1] = Array(MAX_POINTS).fill(0);
+            ecgPlot.setData(ecgData);
+            respPlot.setData(respData);
+        });
+
+        async function readLoop() {
+            const decoder = new TextDecoderStream();
+            const inputDone = port.readable.pipeTo(decoder.writable);
+            const inputStream = decoder.readable;
+            reader = inputStream.getReader();
+
+            while (true) {
+                try {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    
+                    buffer += value;
+                    let lines = buffer.split('\n');
+                    buffer = lines.pop(); // keep last incomplete line
+
+                    for (let line of lines) {
+                        line = line.trim();
+                        if (isPaused || !line) continue;
+
+                        // Parse format: "RESP : 1234   ECG : 5678"
+                        if (line.includes("RESP") && line.includes("ECG")) {
+                            const respPart = line.split("ECG")[0].replace("RESP :", "").trim();
+                            const ecgPart = line.split("ECG :")[1].trim();
+                            
+                            const rVal = parseInt(respPart);
+                            const eVal = parseInt(ecgPart);
+                            
+                            if (!isNaN(rVal) && !isNaN(eVal)) {
+                                ecgData[0].push(sampleIndex);
+                                ecgData[1].push(eVal);
+                                
+                                respData[0].push(sampleIndex);
+                                respData[1].push(rVal);
+
+                                sampleIndex++;
+
+                                if (ecgData[0].length > MAX_POINTS) {
+                                    ecgData[0].shift();
+                                    ecgData[1].shift();
+                                    respData[0].shift();
+                                    respData[1].shift();
+                                }
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error("Read error:", error);
+                    break;
+                }
+            }
+            reader.releaseLock();
+        }
+
+        function renderLoop() {
+            if (!isPaused && port) {
+                ecgPlot.setData(ecgData);
+                respPlot.setData(respData);
+            }
+            requestAnimationFrame(renderLoop);
+        }
+    </script>
+</body>
+</html>
