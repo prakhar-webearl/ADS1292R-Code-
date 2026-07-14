@@ -28,6 +28,9 @@ const monitorEcgDataSchema = new mongoose.Schema(
       type: Boolean,
       required: true,
     },
+    mode: {
+      type: String,
+    },
     data: {
       type: [Number],
       required: true,

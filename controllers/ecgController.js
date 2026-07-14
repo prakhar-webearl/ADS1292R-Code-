@@ -67,6 +67,7 @@ const storeLatestMonitorWindow = async ({
     toSeq: windowChunks[windowChunks.length - 1].seq,
     sr: windowChunks[0].sr,
     lo: windowChunks.some((chunk) => chunk.lo === true),
+    mode: windowChunks[0].mode || undefined,
     data: mergedData,
     abnormalities: latestAbnormalities,
     sampleCount: mergedData.length,
@@ -415,7 +416,7 @@ export const setMonitorSession = async (req, res) => {
 // @access  Public
 export const storeEcgData = async (req, res) => {
   try {
-    const { userId, deviceId, seq, sr, lo, data } = req.body;
+    const { userId, deviceId, seq, sr, lo, data, mode } = req.body;
 
     if (!deviceId) {
       return res.status(400).json({
@@ -463,6 +464,7 @@ export const storeEcgData = async (req, res) => {
       seq,
       sr,
       lo,
+      mode: mode || undefined,
       data,
     });
 
@@ -533,6 +535,7 @@ export const storeEcgData = async (req, res) => {
         seq,
         sr,
         lo,
+        mode: mode || undefined,
         data: Array.isArray(data) ? data : [],
         at: new Date(),
       });
