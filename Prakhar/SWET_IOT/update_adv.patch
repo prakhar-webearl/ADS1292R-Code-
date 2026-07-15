@@ -1,0 +1,34 @@
+--- src/ble_transport.cpp
++++ src/ble_transport.cpp
+@@ -298,14 +298,16 @@
+ }
+ 
+ static void startDirectedAdv() {
+-  NimBLEAddress peerAddr(s_peerMacStr);
+   NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+   pAdv->stop();
+ 
+-  pAdv->setAdvertisementType(BLE_GAP_CONN_MODE_DIR);
+-  pAdv->setMinInterval(0xA0);
+-  pAdv->setMaxInterval(0xA0);
++  // Using General Advertising instead of Directed Advertising.
++  // Modern phones use randomized MAC addresses (RPA) which rotate every 15 mins.
++  // Directed advertising to an old random MAC will be ignored by the phone.
++  // General advertising allows the phone's OS to recognize the bonded ESP32
++  // using the Identity Resolving Keys (IRK) exchanged during pairing and auto-connect.
++  pAdv->setAdvertisementType(BLE_GAP_CONN_MODE_UND);
++  pAdv->addServiceUUID(pService->getUUID());
++  pAdv->setScanResponse(true);
++  pAdv->setMinInterval(0x20);
++  pAdv->setMaxInterval(0x40);
+ 
+   s_inDirectedAdv = true;
+   s_directedAdvStartMs = millis();
+ 
+-  pAdv->start(0, nullptr, &peerAddr);
+-  Serial.printf("[BLE] Directed adv → %s (30 s timeout)\n", s_peerMacStr);
++  NimBLEDevice::startAdvertising();
++  Serial.printf("[BLE] Priority Adv (waiting 30s for %s before WiFi starts)\n", s_peerMacStr);
+ }
+ 
+ static void startGeneralAdv() {
