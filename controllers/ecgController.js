@@ -22,7 +22,7 @@ const ECG_STREAM_RECONNECT_GAP_MS = Number(process.env.ECG_STREAM_RECONNECT_GAP_
 
 const monitorKey = (deviceId, userId) => `${deviceId}::${userId}`;
 
-const getLatestAbnormalitiesForMonitorWindow = async (userId, deviceId, limit = 12) => {
+const getLatestAbnormalitiesForMonitorWindow = async (userId, deviceId, windowStart, windowEnd) => {
   if (!mongoose.Types.ObjectId.isValid(userId)) {
     return [];
   }
@@ -32,7 +32,7 @@ const getLatestAbnormalitiesForMonitorWindow = async (userId, deviceId, limit = 
     deviceId,
   })
     .sort({ lastUpdated: -1 })
-    .limit(15)
+    .limit(30)
     .lean();
 
   const flattened = docs.flatMap((doc) =>
@@ -48,8 +48,17 @@ const getLatestAbnormalitiesForMonitorWindow = async (userId, deviceId, limit = 
     }))
   );
 
-  flattened.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-  return flattened.slice(0, limit);
+  // Only include abnormalities that were detected within this specific window's time range
+  const windowStartMs = windowStart ? new Date(windowStart).getTime() : 0;
+  const windowEndMs = windowEnd ? new Date(windowEnd).getTime() : Date.now();
+
+  const filtered = flattened.filter((abn) => {
+    const ts = new Date(abn.timestamp).getTime();
+    return ts >= windowStartMs && ts <= windowEndMs;
+  });
+
+  filtered.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  return filtered;
 };
 
 const storeLatestMonitorWindow = async ({
@@ -58,7 +67,16 @@ const storeLatestMonitorWindow = async ({
   windowChunks,
 }) => {
   const mergedData = windowChunks.flatMap((chunk) => chunk.data);
-  const latestAbnormalities = await getLatestAbnormalitiesForMonitorWindow(userId, deviceId, 12);
+  const windowStart = windowChunks[0].at;
+  const windowEnd = windowChunks[windowChunks.length - 1].at;
+
+  // Fetch only abnormalities detected within this specific 12-second window
+  const windowAbnormalities = await getLatestAbnormalitiesForMonitorWindow(
+    userId,
+    deviceId,
+    windowStart,
+    windowEnd,
+  );
 
   return MonitorEcgData.create({
     userId,
@@ -69,11 +87,11 @@ const storeLatestMonitorWindow = async ({
     lo: windowChunks.some((chunk) => chunk.lo === true),
     mode: windowChunks[0].mode || undefined,
     data: mergedData,
-    abnormalities: latestAbnormalities,
+    abnormalities: windowAbnormalities,
     sampleCount: mergedData.length,
     durationSeconds: MONITOR_WINDOW_SECONDS,
-    startedAt: windowChunks[0].at,
-    endedAt: windowChunks[windowChunks.length - 1].at,
+    startedAt: windowStart,
+    endedAt: windowEnd,
     monitor: true,
   });
 };
