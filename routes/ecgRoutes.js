@@ -16,11 +16,15 @@ import {
 	getAdminReportDetails,
 	getActiveLiveUsers,
 	streamActiveLiveUsers,
+	generateTwelveLeadEcg,
+	setLeadSession,
 } from '../controllers/ecgController.js';
 
 const router = express.Router();
 
 router.post('/', storeEcgData);
+router.post('/lead-session', setLeadSession);
+router.post('/generate-12-lead', generateTwelveLeadEcg);
 router.post('/monitor/session', setMonitorSession);
 router.put('/device_result', updateDeviceResult);
 router.get('/admin/all-reports', getAdminAllReports);

@@ -1,5 +1,6 @@
 import EcgData from "../models/EcgData.js";
 import MonitorEcgData from "../models/MonitorEcgData.js";
+import TwelveLeadEcg from "../models/TwelveLeadEcg.js";
 import Abnormality from "../models/abnormalityModel.js";
 import User from "../models/userModel.js";
 import AddedUser from "../models/userAddModel.js";
@@ -18,6 +19,7 @@ const monitorBuffers = new Map();
 const lastEcgPostAtByKey = new Map();
 const disconnectTimeoutsByKey = new Map();
 const activeStreamKeyByTargetUserId = new Map();
+const activeLeadSessions = new Map();
 const ECG_STREAM_RECONNECT_GAP_MS = Number(process.env.ECG_STREAM_RECONNECT_GAP_MS || 8000);
 
 const monitorKey = (deviceId, userId) => `${deviceId}::${userId}`;
@@ -429,6 +431,19 @@ export const setMonitorSession = async (req, res) => {
   }
 };
 
+const normalizeLeadName = (leadStr) => {
+  if (!leadStr) return null;
+  const cleaned = String(leadStr).trim().toUpperCase().replace(/[\s_\-]/g, '');
+  if (cleaned === 'L1' || cleaned === 'LEAD1' || cleaned === 'LEADI') return 'L1';
+  if (cleaned === 'L2' || cleaned === 'LEAD2' || cleaned === 'LEADII') return 'L2';
+  if (cleaned === 'L3' || cleaned === 'LEAD3' || cleaned === 'LEADIII') return 'L3';
+  if (cleaned === 'AVR') return 'aVR';
+  if (cleaned === 'AVL') return 'aVL';
+  if (cleaned === 'AVF') return 'aVF';
+  if (['V1', 'V2', 'V3', 'V4', 'V5', 'V6'].includes(cleaned)) return cleaned;
+  return null;
+};
+
 // @desc    Store new ECG data from device
 // @route   POST /api/ecg
 // @access  Public
@@ -475,7 +490,7 @@ export const storeEcgData = async (req, res) => {
     const shouldNotifyNewSession = !lastPostAtMs || nowMs - lastPostAtMs > ECG_STREAM_RECONNECT_GAP_MS;
     lastEcgPostAtByKey.set(key, nowMs);
 
-    // Save the data to MongoDB
+    // Save the data to MongoDB (Existing flow)
     const ecgRecord = await EcgData.create({
       userId: effectiveUserId,
       deviceId: normalizedDeviceId,
@@ -607,6 +622,105 @@ export const storeEcgData = async (req, res) => {
         client.res.write(`data: ${payloadString}\n\n`);
       }
     });
+
+    // --- Seamless 12-Lead Background Accumulation (8s Per Lead) ---
+    const currentLead = normalizeLeadName(mode) || activeLeadSessions.get(key);
+
+    if (currentLead) {
+      try {
+        let activeTest = await TwelveLeadEcg.findOne({
+          $or: [
+            { deviceId: normalizedDeviceId, status: "collecting" },
+            { userId: effectiveUserId, status: "collecting" },
+          ],
+        }).sort({ createdAt: -1 });
+
+        if (!activeTest) {
+          activeTest = await TwelveLeadEcg.create({
+            userId: effectiveUserId,
+            deviceId: normalizedDeviceId,
+            sr: typeof sr === "number" ? sr : 250,
+            status: "collecting",
+            completedLeads: [],
+            totalLeads: 0,
+            leads: {},
+          });
+        }
+
+        if (activeTest && activeTest.status === "collecting") {
+          const sampleRate = typeof sr === "number" && sr > 0 ? sr : (activeTest.sr || 250);
+          const maxTargetSamples = 8 * sampleRate; // 8 seconds of data per lead
+
+          const validSamples = data.map((s) => Number(s) || 0);
+          if (!activeTest.leads) activeTest.leads = {};
+
+          const existingSamples = activeTest.leads[currentLead] || [];
+          if (existingSamples.length < maxTargetSamples) {
+            const updatedLeadSamples = [...existingSamples, ...validSamples].slice(0, maxTargetSamples);
+            activeTest.leads[currentLead] = updatedLeadSamples;
+
+            if (updatedLeadSamples.length >= maxTargetSamples && !activeTest.completedLeads.includes(currentLead)) {
+              activeTest.completedLeads.push(currentLead);
+            }
+          }
+
+          // Check if all 8 physical leads (L1, L2, V1, V2, V3, V4, V5, V6) have completed 8s
+          const REQUIRED_PHYSICAL_LEADS = ["L1", "L2", "V1", "V2", "V3", "V4", "V5", "V6"];
+          const hasAll8PhysicalLeads = REQUIRED_PHYSICAL_LEADS.every(
+            (l) => Array.isArray(activeTest.leads[l]) && activeTest.leads[l].length >= maxTargetSamples
+          );
+
+          if (hasAll8PhysicalLeads) {
+            // Automatically calculate derived limb leads: Lead III, aVR, aVL, aVF
+            const L1_data = activeTest.leads.L1 || [];
+            const L2_data = activeTest.leads.L2 || [];
+            const minLen = Math.min(L1_data.length, L2_data.length);
+
+            const L3_data = [];
+            const aVR_data = [];
+            const aVL_data = [];
+            const aVF_data = [];
+
+            for (let i = 0; i < minLen; i++) {
+              const l1 = L1_data[i];
+              const l2 = L2_data[i];
+
+              const l3 = l2 - l1;
+              const avr = -(l1 + l2) / 2;
+              const avl = l1 - (l2 / 2);
+              const avf = l2 - (l1 / 2);
+
+              L3_data.push(Number(l3.toFixed(4)));
+              aVR_data.push(Number(avr.toFixed(4)));
+              aVL_data.push(Number(avl.toFixed(4)));
+              aVF_data.push(Number(avf.toFixed(4)));
+            }
+
+            activeTest.leads.L3 = L3_data;
+            activeTest.leads.aVR = aVR_data;
+            activeTest.leads.aVL = aVL_data;
+            activeTest.leads.aVF = aVF_data;
+
+            ["L3", "aVR", "aVL", "aVF"].forEach((dName) => {
+              if (!activeTest.completedLeads.includes(dName)) {
+                activeTest.completedLeads.push(dName);
+              }
+            });
+
+            activeTest.status = "completed";
+            activeTest.totalLeads = 12;
+            activeTest.completedAt = new Date();
+
+            activeLeadSessions.delete(key);
+          }
+
+          activeTest.markModified("leads");
+          await activeTest.save();
+        }
+      } catch (twelveLeadErr) {
+        console.error(`Error accumulating 12-lead sample in storeEcgData: ${twelveLeadErr.message}`);
+      }
+    }
 
     res.status(201).json({
       success: true,
@@ -1673,3 +1787,198 @@ export const streamActiveLiveUsers = async (req, res) => {
     clearInterval(intervalId);
   });
 };
+
+// ==========================================
+// 12 LEADS ECG FLOW CONTROLLERS
+// ==========================================
+
+
+// @desc    Calculate missing derived leads and generate full 12-lead ECG report
+// @route   POST /api/ecg/generate-12-lead
+// @access  Public
+export const generateTwelveLeadEcg = async (req, res) => {
+  try {
+    const { deviceId, userId, testId } = req.body;
+
+    if (!deviceId && !userId && !testId) {
+      return res.status(400).json({
+        success: false,
+        message: "deviceId, userId, or testId is required",
+      });
+    }
+
+    let testDoc = null;
+    if (testId && mongoose.Types.ObjectId.isValid(testId)) {
+      testDoc = await TwelveLeadEcg.findById(testId);
+    } else {
+      const query = {};
+      if (deviceId) query.deviceId = String(deviceId).trim();
+      if (userId) query.userId = String(userId).trim();
+
+      testDoc = await TwelveLeadEcg.findOne(query).sort({ createdAt: -1 });
+    }
+
+    if (!testDoc) {
+      return res.status(404).json({
+        success: false,
+        message: "No 12-lead ECG recording found for this device/user",
+      });
+    }
+
+    const L1_data = testDoc.leads.L1 || [];
+    const L2_data = testDoc.leads.L2 || [];
+
+    if (L1_data.length === 0 || L2_data.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Both Lead I (L1) and Lead II (L2) data are required to generate derived leads",
+      });
+    }
+
+    const minLen = Math.min(L1_data.length, L2_data.length);
+    const L3_data = [];
+    const aVR_data = [];
+    const aVL_data = [];
+    const aVF_data = [];
+
+    for (let i = 0; i < minLen; i++) {
+      const l1 = L1_data[i];
+      const l2 = L2_data[i];
+
+      const l3 = l2 - l1;
+      const avr = -(l1 + l2) / 2;
+      const avl = l1 - (l2 / 2);
+      const avf = l2 - (l1 / 2);
+
+      L3_data.push(Number(l3.toFixed(4)));
+      aVR_data.push(Number(avr.toFixed(4)));
+      aVL_data.push(Number(avl.toFixed(4)));
+      aVF_data.push(Number(avf.toFixed(4)));
+    }
+
+    testDoc.leads.L3 = L3_data;
+    testDoc.leads.aVR = aVR_data;
+    testDoc.leads.aVL = aVL_data;
+    testDoc.leads.aVF = aVF_data;
+
+    const allDerived = ["L3", "aVR", "aVL", "aVF"];
+    allDerived.forEach((dName) => {
+      if (!testDoc.completedLeads.includes(dName)) {
+        testDoc.completedLeads.push(dName);
+      }
+    });
+
+    testDoc.status = "completed";
+    testDoc.totalLeads = 12;
+    testDoc.completedAt = new Date();
+
+    testDoc.markModified("leads");
+    await testDoc.save();
+
+    // Clear active lead session map for this device/user
+    if (testDoc.deviceId && testDoc.userId) {
+      const key = monitorKey(testDoc.deviceId, testDoc.userId);
+      activeLeadSessions.delete(key);
+    }
+
+    return res.status(200).json({
+      success: true,
+      completed: true,
+      totalLeads: 12,
+      testId: testDoc._id,
+      leads: {
+        L1: testDoc.leads.L1,
+        L2: testDoc.leads.L2,
+        L3: testDoc.leads.L3,
+        aVR: testDoc.leads.aVR,
+        aVL: testDoc.leads.aVL,
+        aVF: testDoc.leads.aVF,
+        V1: testDoc.leads.V1,
+        V2: testDoc.leads.V2,
+        V3: testDoc.leads.V3,
+        V4: testDoc.leads.V4,
+        V5: testDoc.leads.V5,
+        V6: testDoc.leads.V6,
+      },
+    });
+  } catch (error) {
+    console.error(`Error generating 12-lead ECG: ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      message: "Server Error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc    Set active lead for recording session (e.g., L1, L2, V1..V6)
+// @route   POST /api/ecg/lead-session
+// @access  Public
+export const setLeadSession = async (req, res) => {
+  try {
+    const { deviceId, userId, lead, reset } = req.body;
+
+    if (!deviceId || !userId) {
+      return res.status(400).json({
+        success: false,
+        message: "deviceId and userId are required",
+      });
+    }
+
+    const key = monitorKey(deviceId, userId);
+
+    if (reset) {
+      activeLeadSessions.delete(key);
+      await TwelveLeadEcg.deleteMany({ deviceId, userId, status: "collecting" });
+      return res.status(200).json({
+        success: true,
+        message: "12-lead ECG recording session reset successfully",
+      });
+    }
+
+    const normalizedLead = normalizeLeadName(lead);
+    if (!normalizedLead) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid lead name '${lead}'. Allowed: L1, L2, V1, V2, V3, V4, V5, V6`,
+      });
+    }
+
+    activeLeadSessions.set(key, normalizedLead);
+
+    // Ensure active collecting 12-lead document exists
+    let testDoc = await TwelveLeadEcg.findOne({
+      deviceId: String(deviceId).trim(),
+      userId: String(userId).trim(),
+      status: "collecting",
+    }).sort({ createdAt: -1 });
+
+    if (!testDoc) {
+      testDoc = await TwelveLeadEcg.create({
+        userId: String(userId).trim(),
+        deviceId: String(deviceId).trim(),
+        status: "collecting",
+        completedLeads: [],
+        totalLeads: 0,
+        leads: {},
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      deviceId,
+      userId,
+      activeLead: normalizedLead,
+      testId: testDoc._id,
+      message: `Active lead set to ${normalizedLead}. Incoming /api/ecg data will be saved for ${normalizedLead}.`,
+    });
+  } catch (error) {
+    console.error(`Error setting lead session: ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      message: "Server Error",
+      error: error.message,
+    });
+  }
+};
+
