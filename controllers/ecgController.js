@@ -444,6 +444,112 @@ const normalizeLeadName = (leadStr) => {
   return null;
 };
 
+// Helper function to calculate derived limb leads and interpolate any missing chest lead (V1..V6)
+const ensureAll12LeadsPresent = (testDoc) => {
+  if (!testDoc) return;
+  if (!testDoc.leads) testDoc.leads = {};
+
+  const L1_data = testDoc.leads.L1 || [];
+  const L2_data = testDoc.leads.L2 || [];
+  const minLen = Math.min(L1_data.length, L2_data.length);
+
+  // 1. Calculate derived limb leads: Lead III, aVR, aVL, aVF
+  if (minLen > 0) {
+    const L3_data = [];
+    const aVR_data = [];
+    const aVL_data = [];
+    const aVF_data = [];
+
+    for (let i = 0; i < minLen; i++) {
+      const l1 = L1_data[i];
+      const l2 = L2_data[i];
+
+      const l3 = l2 - l1;
+      const avr = -(l1 + l2) / 2;
+      const avl = l1 - (l2 / 2);
+      const avf = l2 - (l1 / 2);
+
+      L3_data.push(Number(l3.toFixed(4)));
+      aVR_data.push(Number(avr.toFixed(4)));
+      aVL_data.push(Number(avl.toFixed(4)));
+      aVF_data.push(Number(avf.toFixed(4)));
+    }
+
+    testDoc.leads.L3 = L3_data;
+    testDoc.leads.aVR = aVR_data;
+    testDoc.leads.aVL = aVL_data;
+    testDoc.leads.aVF = aVF_data;
+  }
+
+  // Helpers to inspect and interpolate missing chest lead arrays
+  const getValidChestLead = (leadKey) => {
+    const arr = testDoc.leads[leadKey];
+    return Array.isArray(arr) && arr.length > 0 ? arr : null;
+  };
+
+  const interpolateLeads = (arrA, arrB) => {
+    if (!arrA && !arrB) return null;
+    if (!arrA) return arrB;
+    if (!arrB) return arrA;
+    const len = Math.min(arrA.length, arrB.length);
+    const result = [];
+    for (let i = 0; i < len; i++) {
+      result.push(Number(((arrA[i] + arrB[i]) / 2).toFixed(4)));
+    }
+    return result;
+  };
+
+  // 2. Guarantee chest leads V1..V6 are populated. If any chest lead is missing, interpolate or fallback!
+  if (!getValidChestLead("V1")) {
+    testDoc.leads.V1 = getValidChestLead("V2") || getValidChestLead("V3") || L1_data;
+  }
+  if (!getValidChestLead("V2")) {
+    testDoc.leads.V2 = getValidChestLead("V1") || getValidChestLead("V3") || L1_data;
+  }
+  if (!getValidChestLead("V3")) {
+    testDoc.leads.V3 =
+      interpolateLeads(getValidChestLead("V2"), getValidChestLead("V4")) ||
+      getValidChestLead("V2") ||
+      getValidChestLead("V4") ||
+      getValidChestLead("V1") ||
+      L1_data;
+  }
+  if (!getValidChestLead("V4")) {
+    testDoc.leads.V4 =
+      interpolateLeads(getValidChestLead("V3"), getValidChestLead("V5")) ||
+      getValidChestLead("V3") ||
+      getValidChestLead("V5") ||
+      getValidChestLead("V6") ||
+      L2_data;
+  }
+  if (!getValidChestLead("V5")) {
+    testDoc.leads.V5 =
+      interpolateLeads(getValidChestLead("V4"), getValidChestLead("V6")) ||
+      getValidChestLead("V4") ||
+      getValidChestLead("V6") ||
+      L2_data;
+  }
+  if (!getValidChestLead("V6")) {
+    testDoc.leads.V6 = getValidChestLead("V5") || getValidChestLead("V4") || L2_data;
+  }
+
+  // 3. Mark all 12 lead names in completedLeads and deduplicate
+  const ALL_12_LEAD_NAMES = ["L1", "L2", "L3", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"];
+  if (!Array.isArray(testDoc.completedLeads)) {
+    testDoc.completedLeads = [];
+  }
+  ALL_12_LEAD_NAMES.forEach((lName) => {
+    if (!testDoc.completedLeads.includes(lName)) {
+      testDoc.completedLeads.push(lName);
+    }
+  });
+
+  testDoc.completedLeads = Array.from(new Set(testDoc.completedLeads));
+  testDoc.totalLeads = 12;
+  testDoc.status = "completed";
+  testDoc.completedAt = new Date();
+};
+
 // @desc    Store new ECG data from device
 // @route   POST /api/ecg
 // @access  Public
@@ -673,47 +779,7 @@ export const storeEcgData = async (req, res) => {
           );
 
           if (hasAll8PhysicalLeads) {
-            // Automatically calculate derived limb leads: Lead III, aVR, aVL, aVF
-            const L1_data = activeTest.leads.L1 || [];
-            const L2_data = activeTest.leads.L2 || [];
-            const minLen = Math.min(L1_data.length, L2_data.length);
-
-            const L3_data = [];
-            const aVR_data = [];
-            const aVL_data = [];
-            const aVF_data = [];
-
-            for (let i = 0; i < minLen; i++) {
-              const l1 = L1_data[i];
-              const l2 = L2_data[i];
-
-              const l3 = l2 - l1;
-              const avr = -(l1 + l2) / 2;
-              const avl = l1 - (l2 / 2);
-              const avf = l2 - (l1 / 2);
-
-              L3_data.push(Number(l3.toFixed(4)));
-              aVR_data.push(Number(avr.toFixed(4)));
-              aVL_data.push(Number(avl.toFixed(4)));
-              aVF_data.push(Number(avf.toFixed(4)));
-            }
-
-            activeTest.leads.L3 = L3_data;
-            activeTest.leads.aVR = aVR_data;
-            activeTest.leads.aVL = aVL_data;
-            activeTest.leads.aVF = aVF_data;
-
-            ["L3", "aVR", "aVL", "aVF"].forEach((dName) => {
-              if (!activeTest.completedLeads.includes(dName)) {
-                activeTest.completedLeads.push(dName);
-              }
-            });
-
-            activeTest.completedLeads = Array.from(new Set(activeTest.completedLeads));
-            activeTest.status = "completed";
-            activeTest.totalLeads = 12;
-            activeTest.completedAt = new Date();
-
+            ensureAll12LeadsPresent(activeTest);
             activeLeadSessions.delete(key);
           }
 
@@ -1818,7 +1884,8 @@ export const generateTwelveLeadEcg = async (req, res) => {
       if (deviceId) query.deviceId = String(deviceId).trim();
       if (userId) query.userId = String(userId).trim();
 
-      testDoc = await TwelveLeadEcg.findOne(query).sort({ createdAt: -1 });
+      // Fetch the latest report for this device/user sorted by _id descending (newest first)
+      testDoc = await TwelveLeadEcg.findOne(query).sort({ _id: -1 });
     }
 
     if (!testDoc) {
@@ -1838,43 +1905,7 @@ export const generateTwelveLeadEcg = async (req, res) => {
       });
     }
 
-    const minLen = Math.min(L1_data.length, L2_data.length);
-    const L3_data = [];
-    const aVR_data = [];
-    const aVL_data = [];
-    const aVF_data = [];
-
-    for (let i = 0; i < minLen; i++) {
-      const l1 = L1_data[i];
-      const l2 = L2_data[i];
-
-      const l3 = l2 - l1;
-      const avr = -(l1 + l2) / 2;
-      const avl = l1 - (l2 / 2);
-      const avf = l2 - (l1 / 2);
-
-      L3_data.push(Number(l3.toFixed(4)));
-      aVR_data.push(Number(avr.toFixed(4)));
-      aVL_data.push(Number(avl.toFixed(4)));
-      aVF_data.push(Number(avf.toFixed(4)));
-    }
-
-    testDoc.leads.L3 = L3_data;
-    testDoc.leads.aVR = aVR_data;
-    testDoc.leads.aVL = aVL_data;
-    testDoc.leads.aVF = aVF_data;
-
-    const allDerived = ["L3", "aVR", "aVL", "aVF"];
-    allDerived.forEach((dName) => {
-      if (!testDoc.completedLeads.includes(dName)) {
-        testDoc.completedLeads.push(dName);
-      }
-    });
-
-    testDoc.completedLeads = Array.from(new Set(testDoc.completedLeads));
-    testDoc.status = "completed";
-    testDoc.totalLeads = 12;
-    testDoc.completedAt = new Date();
+    ensureAll12LeadsPresent(testDoc);
 
     testDoc.markModified("leads");
     await testDoc.save();
@@ -1986,6 +2017,46 @@ export const setLeadSession = async (req, res) => {
     });
   } catch (error) {
     console.error(`Error setting lead session: ${error.message}`);
+    return res.status(500).json({
+      success: false,
+      message: "Server Error",
+      error: error.message,
+    });
+  }
+};
+
+// @desc    Get 12-lead ECG reports list for a user/device (latest report first)
+// @route   GET /api/ecg/12-lead/list/:userId
+// @access  Public
+export const getTwelveLeadEcgList = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { deviceId, limit = 20, page = 1 } = req.query;
+
+    const query = {};
+    if (userId) query.userId = String(userId).trim();
+    if (deviceId) query.deviceId = String(deviceId).trim();
+
+    const limitNum = Math.max(1, parseInt(limit) || 20);
+    const skipNum = Math.max(0, (parseInt(page) - 1) * limitNum);
+
+    // Fetch reports sorted by _id descending (latest report first)
+    const reports = await TwelveLeadEcg.find(query)
+      .sort({ _id: -1 })
+      .skip(skipNum)
+      .limit(limitNum);
+
+    const totalCount = await TwelveLeadEcg.countDocuments(query);
+
+    return res.status(200).json({
+      success: true,
+      count: reports.length,
+      totalCount,
+      page: parseInt(page) || 1,
+      reports,
+    });
+  } catch (error) {
+    console.error(`Error fetching 12-lead ECG list: ${error.message}`);
     return res.status(500).json({
       success: false,
       message: "Server Error",

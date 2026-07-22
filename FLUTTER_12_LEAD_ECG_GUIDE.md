@@ -1,6 +1,6 @@
 # Flutter 12-Lead ECG Integration Guide
 
-This guide explains how to implement the **12-Lead ECG Workflow** in your Flutter mobile application, including **retesting/re-recording single leads**.
+This guide explains how to implement the **12-Lead ECG Workflow** in your Flutter mobile application, including **how to retrieve the latest report** and **how to list past reports (newest first)**.
 
 > ℹ️ **Important Hardware Note**:  
 > The ESP32 device automatically streams continuous raw ECG data directly to `POST /api/ecg`.  
@@ -35,7 +35,8 @@ This guide explains how to implement the **12-Lead ECG Workflow** in your Flutte
                                 ▼
  ┌─────────────────────────────────────────────────────────────┐
  │  Backend computes derived leads: L3, aVR, aVL, aVF         │
- │  Returns JSON with all 12 lead arrays                       │
+ │  Interpolates any missing chest lead (e.g. V3)             │
+ │  Returns JSON with all 12 lead arrays (Latest Report)       │
  └──────────────────────────────┬──────────────────────────────┘
                                 │
                                 ▼
@@ -46,18 +47,9 @@ This guide explains how to implement the **12-Lead ECG Workflow** in your Flutte
 
 ---
 
-## 2. Retesting a Lead (Overwriting Data)
+## 2. API Endpoints for Flutter
 
-If the user wants to **Retest** a specific lead (e.g. `V1` was noisy or electrodes slipped):
-1. The app simply calls `POST /api/ecg/lead-session` again with `{ "deviceId": "...", "userId": "...", "lead": "V1" }`.
-2. The backend **automatically clears the old `V1` buffer** and prepares for a fresh 8-second recording.
-3. The new 8-second recording updates/overwrites `V1` cleanly without duplicating array entries!
-
----
-
-## 3. API Endpoints for Flutter
-
-### 3.1 Set Active Lead Session (or Retest Lead)
+### 2.1 Set Active Lead Session (or Retest Lead)
 - **Endpoint:** `POST /api/ecg/lead-session`
 - **Description:** Sets active lead position and resets buffer for a fresh 8-second recording/retest.
 
@@ -66,25 +58,13 @@ If the user wants to **Retest** a specific lead (e.g. `V1` was noisy or electrod
 {
   "deviceId": "ESP32_001",
   "userId": "65b1c900e123456789abcdef",
-  "lead": "V1"
-}
-```
-
-**Response (200 OK):**
-```json
-{
-  "success": true,
-  "deviceId": "ESP32_001",
-  "userId": "65b1c900e123456789abcdef",
-  "activeLead": "V1",
-  "testId": "69ca740bfa123456789abcde",
-  "message": "Active lead set to V1. Buffer cleared for fresh recording/retest of V1."
+  "lead": "L1"
 }
 ```
 
 ---
 
-### 3.2 Reset Full 12-Lead Session (Start New Test)
+### 2.2 Reset Full 12-Lead Session (Start New Test)
 To reset the entire test and start a new 12-lead ECG session from scratch:
 ```json
 {
@@ -96,9 +76,9 @@ To reset the entire test and start a new 12-lead ECG session from scratch:
 
 ---
 
-### 3.3 Generate & Retrieve 12-Lead Report
+### 2.3 Generate & Retrieve 12-Lead Report (Latest Report)
 - **Endpoint:** `POST /api/ecg/generate-12-lead`
-- **Description:** Called after recording all 8 physical leads. Derives `L3`, `aVR`, `aVL`, `aVF` and returns all 12 leads.
+- **Description:** Returns the **absolute latest** 12-lead report for the given `deviceId` and `userId` (sorted by `{ _id: -1 }`). Derives `L3`, `aVR`, `aVL`, `aVF` and interpolates any missing chest lead.
 
 **Request Body:**
 ```json
@@ -108,9 +88,65 @@ To reset the entire test and start a new 12-lead ECG session from scratch:
 }
 ```
 
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "completed": true,
+  "totalLeads": 12,
+  "testId": "69ca740bfa123456789abcde",
+  "leads": {
+    "L1": [ ... ],
+    "L2": [ ... ],
+    "L3": [ ... ],
+    "aVR": [ ... ],
+    "aVL": [ ... ],
+    "aVF": [ ... ],
+    "V1": [ ... ],
+    "V2": [ ... ],
+    "V3": [ ... ],
+    "V4": [ ... ],
+    "V5": [ ... ],
+    "V6": [ ... ]
+  }
+}
+```
+
 ---
 
-## 4. Flutter Implementation Service (`TwelveLeadEcgService.dart`)
+### 2.4 List All 12-Lead ECG Reports (Latest First)
+- **Endpoint:** `GET /api/ecg/12-lead/list/:userId?deviceId=ESP32_001`
+- **Description:** Returns all 12-lead ECG reports for the user, with the **latest report appearing first** (`reports[0]`).
+
+**Response (200 OK):**
+```json
+{
+  "success": true,
+  "count": 2,
+  "totalCount": 2,
+  "page": 1,
+  "reports": [
+    {
+      "_id": "6a60d1649eb674bc3a04af6b",
+      "createdAt": "2026-07-22T19:45:00.000Z",
+      "status": "completed",
+      "totalLeads": 12,
+      "leads": { ... }
+    },
+    {
+      "_id": "6a60ccc65f1cc43c6269a84d",
+      "createdAt": "2026-07-22T18:15:00.000Z",
+      "status": "completed",
+      "totalLeads": 12,
+      "leads": { ... }
+    }
+  ]
+}
+```
+
+---
+
+## 3. Flutter Implementation Service (`TwelveLeadEcgService.dart`)
 
 ```dart
 import 'dart:convert';
@@ -121,7 +157,7 @@ class TwelveLeadEcgService {
 
   TwelveLeadEcgService({required this.baseUrl});
 
-  /// Set Active Lead Session before recording or retesting
+  /// 1. Set Active Lead Session before recording or retesting
   Future<bool> setLeadSession({
     required String deviceId,
     required String userId,
@@ -148,7 +184,7 @@ class TwelveLeadEcgService {
     }
   }
 
-  /// Generate & Fetch complete 12-lead data after recording
+  /// 2. Generate & Fetch complete 12-lead data (ALWAYS returns the LATEST report)
   Future<Map<String, dynamic>?> generate12LeadReport({
     required String deviceId,
     required String userId,
@@ -171,6 +207,30 @@ class TwelveLeadEcgService {
       print('Error generating 12-lead report: $e');
     }
     return null;
+  }
+
+  /// 3. Fetch List of All 12-Lead Reports for User (LATEST REPORT FIRST)
+  Future<List<dynamic>> fetchUser12LeadReports({
+    required String userId,
+    String? deviceId,
+  }) async {
+    try {
+      var url = '$baseUrl/api/ecg/12-lead/list/$userId';
+      if (deviceId != null) {
+        url += '?deviceId=$deviceId';
+      }
+
+      final response = await http.get(Uri.parse(url));
+      final data = jsonDecode(response.body);
+
+      if (data['success'] == true && data['reports'] != null) {
+        // data['reports'][0] is the LATEST report!
+        return data['reports'] as List<dynamic>;
+      }
+    } catch (e) {
+      print('Error fetching 12-lead reports list: $e');
+    }
+    return [];
   }
 }
 ```

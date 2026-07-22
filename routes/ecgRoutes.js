@@ -18,6 +18,7 @@ import {
 	streamActiveLiveUsers,
 	generateTwelveLeadEcg,
 	setLeadSession,
+	getTwelveLeadEcgList,
 } from '../controllers/ecgController.js';
 
 const router = express.Router();
@@ -25,6 +26,7 @@ const router = express.Router();
 router.post('/', storeEcgData);
 router.post('/lead-session', setLeadSession);
 router.post('/generate-12-lead', generateTwelveLeadEcg);
+router.get('/12-lead/list/:userId', getTwelveLeadEcgList);
 router.post('/monitor/session', setMonitorSession);
 router.put('/device_result', updateDeviceResult);
 router.get('/admin/all-reports', getAdminAllReports);

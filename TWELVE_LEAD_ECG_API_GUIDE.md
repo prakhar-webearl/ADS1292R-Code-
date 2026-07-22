@@ -60,17 +60,12 @@ This document explains how your **Hardware / Mobile App** records 8 seconds of d
 
 ---
 
-### 2.3 Fetch / Generate Completed 12-Lead Report
-- **Endpoint:** `POST /api/ecg/generate-12-lead`
-- **Request Body:**
-```json
-{
-  "deviceId": "ESP32_001",
-  "userId": "user123"
-}
-```
+### 2.3 Fetch / Generate Latest 12-Lead Report
+- **Endpoint:** `POST /api/ecg/generate-12-lead` or `GET /api/ecg/generate-12-lead` or `GET /api/ecg/12-lead/latest`
+- **GET Request:** `GET /api/ecg/generate-12-lead?deviceId=ESP32_001&userId=user123`
+- **Description:** Returns the **absolute latest** 12-lead report for the given `deviceId` and `userId` (sorted by `{ _id: -1, updatedAt: -1 }`).
 
-#### Response Payload (All 12 Leads - 8 Seconds Each)
+#### Response Payload (All 12 Leads - Guaranteed Latest Document)
 ```json
 {
   "success": true,
@@ -86,7 +81,7 @@ This document explains how your **Hardware / Mobile App** records 8 seconds of d
     "aVF": [ ... 8s derived ... ],
     "V1": [ ... 8s data ... ],
     "V2": [ ... 8s data ... ],
-    "V3": [ ... 8s data ... ],
+    "V3": [ ... 8s data/interpolated ... ],
     "V4": [ ... 8s data ... ],
     "V5": [ ... 8s data ... ],
     "V6": [ ... 8s data ... ]
