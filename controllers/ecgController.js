@@ -1960,8 +1960,16 @@ export const setLeadSession = async (req, res) => {
         status: "collecting",
         completedLeads: [],
         totalLeads: 0,
-        leads: {},
+        leads: { [normalizedLead]: [] },
       });
+    } else {
+      // Retest / fresh lead start: reset buffer for this lead
+      if (!testDoc.leads) testDoc.leads = {};
+      testDoc.leads[normalizedLead] = [];
+      testDoc.completedLeads = (testDoc.completedLeads || []).filter((l) => l !== normalizedLead);
+
+      testDoc.markModified("leads");
+      await testDoc.save();
     }
 
     return res.status(200).json({
@@ -1970,7 +1978,7 @@ export const setLeadSession = async (req, res) => {
       userId,
       activeLead: normalizedLead,
       testId: testDoc._id,
-      message: `Active lead set to ${normalizedLead}. Incoming /api/ecg data will be saved for ${normalizedLead}.`,
+      message: `Active lead set to ${normalizedLead}. Buffer cleared for fresh recording/retest of ${normalizedLead}.`,
     });
   } catch (error) {
     console.error(`Error setting lead session: ${error.message}`);
