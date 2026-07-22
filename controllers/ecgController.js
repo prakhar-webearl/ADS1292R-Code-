@@ -664,6 +664,8 @@ export const storeEcgData = async (req, res) => {
             }
           }
 
+          activeTest.completedLeads = Array.from(new Set(activeTest.completedLeads));
+
           // Check if all 8 physical leads (L1, L2, V1, V2, V3, V4, V5, V6) have completed 8s
           const REQUIRED_PHYSICAL_LEADS = ["L1", "L2", "V1", "V2", "V3", "V4", "V5", "V6"];
           const hasAll8PhysicalLeads = REQUIRED_PHYSICAL_LEADS.every(
@@ -707,6 +709,7 @@ export const storeEcgData = async (req, res) => {
               }
             });
 
+            activeTest.completedLeads = Array.from(new Set(activeTest.completedLeads));
             activeTest.status = "completed";
             activeTest.totalLeads = 12;
             activeTest.completedAt = new Date();
@@ -1868,6 +1871,7 @@ export const generateTwelveLeadEcg = async (req, res) => {
       }
     });
 
+    testDoc.completedLeads = Array.from(new Set(testDoc.completedLeads));
     testDoc.status = "completed";
     testDoc.totalLeads = 12;
     testDoc.completedAt = new Date();
