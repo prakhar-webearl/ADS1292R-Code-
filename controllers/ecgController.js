@@ -21,6 +21,7 @@ const disconnectTimeoutsByKey = new Map();
 const activeStreamKeyByTargetUserId = new Map();
 const activeLeadSessions = new Map();
 const ECG_STREAM_RECONNECT_GAP_MS = Number(process.env.ECG_STREAM_RECONNECT_GAP_MS || 8000);
+export const MAX_PLAUSIBLE_ADC_MAGNITUDE = Number(process.env.MAX_PLAUSIBLE_ADC_MAGNITUDE || 250000);
 
 const monitorKey = (deviceId, userId) => `${deviceId}::${userId}`;
 
@@ -444,13 +445,101 @@ const normalizeLeadName = (leadStr) => {
   return null;
 };
 
+/**
+ * Task A: Sanitizes raw ECG sample arrays by replacing invalid/corrupted spikes
+ * exceeding MAX_PLAUSIBLE_ADC_MAGNITUDE with the last known-good sample value.
+ */
+const sanitizeSamples = (samples, initialLastGood = null, leadName = "unknown") => {
+  if (!Array.isArray(samples)) return { sanitized: [], lastGood: initialLastGood };
+
+  let currentLastGood = initialLastGood;
+  const sanitized = [];
+
+  for (let rawS of samples) {
+    let numVal = Number(rawS);
+    if (isNaN(numVal) || Math.abs(numVal) > MAX_PLAUSIBLE_ADC_MAGNITUDE) {
+      console.warn(
+        `[ECG Sample Sanitizer] Corrupted/out-of-bounds spike (${rawS}) in lead ${leadName}. ` +
+        `Replacing with last known-good value (${currentLastGood ?? 0}).`
+      );
+      numVal = currentLastGood !== null ? currentLastGood : 0;
+    } else {
+      currentLastGood = numVal;
+    }
+    sanitized.push(numVal);
+  }
+
+  return { sanitized, lastGood: currentLastGood };
+};
+
+/**
+ * Task B: Detrends an ECG signal using moving-average baseline subtraction.
+ * Window size is ~0.2s worth of samples based on sampling rate sr.
+ */
+const detrendSignal = (arr, sr = 250) => {
+  if (!Array.isArray(arr) || arr.length === 0) return [];
+  const sampleRate = typeof sr === "number" && sr > 0 ? sr : 250;
+  const windowSize = Math.max(1, Math.round(0.2 * sampleRate)); // ~0.2s window
+  const halfWindow = Math.floor(windowSize / 2);
+  const len = arr.length;
+  const detrended = new Array(len);
+
+  let currentSum = 0;
+  let count = 0;
+
+  const initialEnd = Math.min(len, halfWindow + 1);
+  for (let k = 0; k < initialEnd; k++) {
+    currentSum += arr[k];
+    count++;
+  }
+
+  for (let i = 0; i < len; i++) {
+    if (i > 0) {
+      const addIndex = i + halfWindow;
+      if (addIndex < len) {
+        currentSum += arr[addIndex];
+        count++;
+      }
+      const removeIndex = i - halfWindow - 1;
+      if (removeIndex >= 0) {
+        currentSum -= arr[removeIndex];
+        count--;
+      }
+    }
+    const baseline = currentSum / count;
+    detrended[i] = Number((arr[i] - baseline).toFixed(4));
+  }
+
+  return detrended;
+};
+
 // Helper function to calculate derived limb leads and interpolate any missing chest lead (V1..V6)
 const ensureAll12LeadsPresent = (testDoc) => {
   if (!testDoc) return;
   if (!testDoc.leads) testDoc.leads = {};
 
-  const L1_data = testDoc.leads.L1 || [];
-  const L2_data = testDoc.leads.L2 || [];
+  const sr = testDoc.sr || 250;
+  const L1_raw = testDoc.leads.L1 || [];
+  const L2_raw = testDoc.leads.L2 || [];
+
+  // Task C: Config-level sanity check log warning for excessive baseline drift / range discrepancies
+  if (L1_raw.length > 0 && L2_raw.length > 0) {
+    const rangeL1 = Math.max(...L1_raw) - Math.min(...L1_raw);
+    const rangeL2 = Math.max(...L2_raw) - Math.min(...L2_raw);
+    const driftL2 = Math.abs(L2_raw[L2_raw.length - 1] - L2_raw[0]);
+
+    if (rangeL2 > rangeL1 * 3 || driftL2 > 50000) {
+      console.warn(
+        `[ECG Hardware Drift Warning] Device ${testDoc.deviceId} / User ${testDoc.userId}: ` +
+        `Lead II range (${rangeL2}) or drift magnitude (${driftL2}) is far outside Lead I baseline (${rangeL1}). ` +
+        `Detrending applied, but check hardware electrode contact / RC settling.`
+      );
+    }
+  }
+
+  // Task B: Detrend L1 and L2 independently (moving-average baseline subtraction) before calculating derived leads
+  const L1_data = detrendSignal(L1_raw, sr);
+  const L2_data = detrendSignal(L2_raw, sr);
   const minLen = Math.min(L1_data.length, L2_data.length);
 
   // 1. Calculate derived limb leads: Lead III, aVR, aVL, aVF
@@ -480,6 +569,9 @@ const ensureAll12LeadsPresent = (testDoc) => {
     testDoc.leads.aVL = aVL_data;
     testDoc.leads.aVF = aVF_data;
   }
+
+  // Task E Note: Sequential L1/L2 recording R-peak alignment (beat-by-beat phase alignment)
+  // is reserved as a designated follow-up phase after Task A and B deployment.
 
   // Helpers to inspect and interpolate missing chest lead arrays
   const getValidChestLead = (leadKey) => {
@@ -757,16 +849,32 @@ export const storeEcgData = async (req, res) => {
           const sampleRate = typeof sr === "number" && sr > 0 ? sr : (activeTest.sr || 250);
           const maxTargetSamples = 8 * sampleRate; // 8 seconds of data per lead
 
-          const validSamples = data.map((s) => Number(s) || 0);
           if (!activeTest.leads) activeTest.leads = {};
 
           const existingSamples = activeTest.leads[currentLead] || [];
+          const lastGoodVal = existingSamples.length > 0 ? existingSamples[existingSamples.length - 1] : null;
+
+          // Task A: Sanitize samples before pushing to leads (reject spikes > MAX_PLAUSIBLE_ADC_MAGNITUDE)
+          const { sanitized: sanitizedChunk } = sanitizeSamples(data, lastGoodVal, currentLead);
+
           if (existingSamples.length < maxTargetSamples) {
-            const updatedLeadSamples = [...existingSamples, ...validSamples].slice(0, maxTargetSamples);
+            const updatedLeadSamples = [...existingSamples, ...sanitizedChunk].slice(0, maxTargetSamples);
             activeTest.leads[currentLead] = updatedLeadSamples;
 
             if (updatedLeadSamples.length >= maxTargetSamples && !activeTest.completedLeads.includes(currentLead)) {
               activeTest.completedLeads.push(currentLead);
+            }
+          }
+
+          // Task D: Check lo (lead-off) flag consistency with large offsets / spikes
+          if (lo === false) {
+            const hasCorruptedSpike = data.some((s) => Math.abs(Number(s)) > MAX_PLAUSIBLE_ADC_MAGNITUDE);
+            if (hasCorruptedSpike) {
+              console.warn(
+                `[ECG Lead-Off Warning] Device ${normalizedDeviceId}: Chunk received with lo: false ` +
+                `but sample magnitude exceeds MAX_PLAUSIBLE_ADC_MAGNITUDE (${MAX_PLAUSIBLE_ADC_MAGNITUDE}). ` +
+                `Hardware lead-off detection threshold may be too loose for slow-settling / high-offset artifacts.`
+              );
             }
           }
 
