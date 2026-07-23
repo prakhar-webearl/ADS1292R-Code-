@@ -444,76 +444,82 @@ const normalizeLeadName = (leadStr) => {
   return null;
 };
 
-// --- 12-LEAD ECG SIGNAL PROCESSING PIPELINE HELPERS ---
+// --- 12-LEAD ECG BACKEND PIPELINE (8-STEP SPECIFICATION) ---
 
 /**
- * Step 1: Discard initial settling window (ADS1292R channel-settling transient).
- * Dynamically detects and trims initial settling samples (empirically ~120-150 samples)
- * where the input coupling network rail-crawls before reaching steady state.
+ * Step 1: Pre-validation (run before any math)
+ * Rejects records with mismatched lengths or empty data.
  */
-export const discardSettlingWindow = (samples, settlingCount = 125) => {
-  if (!Array.isArray(samples) || samples.length === 0) return [];
-
-  const total = samples.length;
-  let actualSettling = total > settlingCount + 50 ? settlingCount : Math.floor(total * 0.15);
-
-  // Adaptive settling detection: detect where DC offset collapses to steady state
-  if (total > 200) {
-    const endSlice = samples.slice(Math.min(200, total - 100)).sort((a, b) => a - b);
-    const steadyStateMed = endSlice[Math.floor(endSlice.length / 2)];
-
-    let adaptiveIdx = 0;
-    const offsetThreshold = 50000;
-    while (adaptiveIdx < Math.min(250, total - 50) && Math.abs(samples[adaptiveIdx] - steadyStateMed) > offsetThreshold) {
-      adaptiveIdx++;
-    }
-    if (adaptiveIdx > actualSettling) {
-      actualSettling = adaptiveIdx;
-    }
+export const validateInputs = (L1, L2) => {
+  if (!Array.isArray(L1) || !Array.isArray(L2)) {
+    return { valid: false, message: "L1 and L2 must be valid arrays", code: "invalid_type" };
   }
-
-  return samples.slice(actualSettling);
+  if (L1.length === 0 || L2.length === 0) {
+    return { valid: false, message: "Both Lead I (L1) and Lead II (L2) data are required", code: "empty_data" };
+  }
+  if (L1.length !== L2.length) {
+    return {
+      valid: false,
+      message: `Alignment error: Lead I length (${L1.length}) does not match Lead II length (${L2.length})`,
+      code: "alignment_error",
+    };
+  }
+  return { valid: true, length: L1.length };
 };
 
 /**
- * Step 2: Outlier rejection / spike removal on raw channel independently.
- * Replaces isolated single-sample ADC mux transients with linear interpolation.
+ * Step 2: Settling-window trim (applied identically across channels)
+ * Removes ADS1292R input coupling DC settling transient before processing.
  */
-export const removeOutliersAndSpikes = (samples, windowRadius = 5, multiplier = 4.0) => {
-  if (!Array.isArray(samples) || samples.length < windowRadius * 2 + 1) {
-    return samples ? [...samples] : [];
+export const trimSettling = (channel, settleSamples = 125) => {
+  if (!Array.isArray(channel) || channel.length === 0) return [];
+  if (channel.length <= settleSamples + 20) {
+    return [...channel];
+  }
+  return channel.slice(settleSamples);
+};
+
+/**
+ * Step 3: Outlier rejection (MAD-based despike per channel, k=6)
+ * Replaces isolated single-sample ADC mux transients with linear neighbor interpolation.
+ */
+export const despikeChannel = (channel, windowRadius = 5, k = 6) => {
+  if (!Array.isArray(channel) || channel.length < windowRadius * 2 + 1) {
+    return { cleaned: channel ? [...channel] : [], spikeCount: 0 };
   }
 
-  const result = [...samples];
+  const result = [...channel];
   const len = result.length;
-  const isOutlier = new Array(len).fill(false);
+  const isSpike = new Array(len).fill(false);
+  let spikeCount = 0;
 
   for (let i = 0; i < len; i++) {
     const start = Math.max(0, i - windowRadius);
     const end = Math.min(len, i + windowRadius + 1);
-    const windowVals = result.slice(start, end).sort((a, b) => a - b);
-    const med = windowVals[Math.floor(windowVals.length / 2)];
+    const local = result.slice(start, end).sort((a, b) => a - b);
+    const med = local[Math.floor(local.length / 2)];
 
     // Median Absolute Deviation (MAD)
-    const absDevs = windowVals.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+    const absDevs = local.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
     const mad = absDevs[Math.floor(absDevs.length / 2)];
 
-    // Minimum threshold prevents flagging normal high-voltage QRS peaks as outliers
-    const threshold = Math.max(mad * multiplier, 15000);
+    // Minimum floor threshold prevents flagging normal high-voltage QRS peaks as spikes
+    const threshold = Math.max(mad * k, 15000);
 
     if (Math.abs(result[i] - med) > threshold) {
-      isOutlier[i] = true;
+      isSpike[i] = true;
+      spikeCount++;
     }
   }
 
-  // Linear interpolation for flagged outliers
+  // Linear interpolation for flagged spikes
   for (let i = 0; i < len; i++) {
-    if (isOutlier[i]) {
+    if (isSpike[i]) {
       let prevValid = i - 1;
-      while (prevValid >= 0 && isOutlier[prevValid]) prevValid--;
+      while (prevValid >= 0 && isSpike[prevValid]) prevValid--;
 
       let nextValid = i + 1;
-      while (nextValid < len && isOutlier[nextValid]) nextValid++;
+      while (nextValid < len && isSpike[nextValid]) nextValid++;
 
       if (prevValid >= 0 && nextValid < len) {
         const factor = (i - prevValid) / (nextValid - prevValid);
@@ -526,24 +532,24 @@ export const removeOutliersAndSpikes = (samples, windowRadius = 5, multiplier = 
     }
   }
 
-  return result;
+  return { cleaned: result, spikeCount };
 };
 
 /**
- * Step 3: Per-channel baseline wander correction using downsampled rolling median filter.
- * Matched method and window applied to all raw channels.
+ * Step 4: Baseline correction (matched parameters on both channels)
+ * Applies downsampled rolling median baseline wander subtraction.
  */
-export const removeBaselineWander = (samples, windowSize = 250) => {
-  if (!Array.isArray(samples) || samples.length === 0) return [];
-  if (samples.length < 50) {
-    const m = mean(samples);
-    return samples.map((v) => v - m);
+export const removeBaseline = (channel, windowSize = 250) => {
+  if (!Array.isArray(channel) || channel.length === 0) return [];
+  if (channel.length < 50) {
+    const m = mean(channel);
+    return channel.map((v) => v - m);
   }
 
   const dsFactor = 5;
   const downsampled = [];
-  for (let i = 0; i < samples.length; i += dsFactor) {
-    downsampled.push(samples[i]);
+  for (let i = 0; i < channel.length; i += dsFactor) {
+    downsampled.push(channel[i]);
   }
 
   const dsWin = Math.max(5, Math.floor(windowSize / dsFactor));
@@ -558,8 +564,8 @@ export const removeBaselineWander = (samples, windowSize = 250) => {
   }
 
   // Interpolate baseline back to full sample length
-  const baseline = new Array(samples.length);
-  for (let i = 0; i < samples.length; i++) {
+  const baseline = new Array(channel.length);
+  for (let i = 0; i < channel.length; i++) {
     const dsIdx = i / dsFactor;
     const i1 = Math.floor(dsIdx);
     const i2 = Math.min(downsampled.length - 1, i1 + 1);
@@ -567,99 +573,133 @@ export const removeBaselineWander = (samples, windowSize = 250) => {
     baseline[i] = dsBaseline[i1] + frac * ((dsBaseline[i2] ?? dsBaseline[i1]) - dsBaseline[i1]);
   }
 
-  return samples.map((v, i) => v - baseline[i]);
+  return channel.map((v, i) => v - baseline[i]);
 };
 
 /**
- * Executes Steps 1, 2, and 3 on a raw input lead channel.
+ * Step 6: Derive the 4 limb leads (L3, aVR, aVL, aVF)
  */
-export const cleanRawChannel = (samples, settlingCount = 125, baselineWindow = 250) => {
-  if (!Array.isArray(samples) || samples.length === 0) return [];
-  
-  // Step 1: Discard initial settling window
-  const trimmed = discardSettlingWindow(samples, settlingCount);
+export const deriveLeads = (L1, L2) => {
+  const N = L1.length;
+  const L3 = new Array(N);
+  const aVR = new Array(N);
+  const aVL = new Array(N);
+  const aVF = new Array(N);
 
-  // Step 2: Outlier / spike rejection
-  const deSpiked = removeOutliersAndSpikes(trimmed);
+  for (let i = 0; i < N; i++) {
+    const l1 = L1[i];
+    const l2 = L2[i];
 
-  // Step 3: Matched baseline wander correction
-  const baseCorrected = removeBaselineWander(deSpiked, baselineWindow);
+    L3[i] = Number((l2 - l1).toFixed(4));
+    aVR[i] = Number((-(l1 + l2) / 2).toFixed(4));
+    aVL[i] = Number((l1 - l2 / 2).toFixed(4));
+    aVF[i] = Number((l2 - l1 / 2).toFixed(4));
+  }
 
-  return baseCorrected;
+  return { L3, aVR, aVL, aVF };
+};
+
+/**
+ * Step 7: Post-derivation validation (Einthoven's Law & Goldberger Identity)
+ */
+export const validateDerivation = (L1, L2, L3, aVR, aVL, aVF, tol = 1.0) => {
+  let maxEinthovenErr = 0;
+  let maxGoldbergerErr = 0;
+  let valid = true;
+
+  for (let i = 0; i < L1.length; i++) {
+    const einthovenErr = Math.abs(L1[i] + L3[i] - L2[i]);
+    const goldbergerErr = Math.abs(aVR[i] + aVL[i] + aVF[i]);
+
+    if (einthovenErr > maxEinthovenErr) maxEinthovenErr = einthovenErr;
+    if (goldbergerErr > maxGoldbergerErr) maxGoldbergerErr = goldbergerErr;
+
+    if (einthovenErr >= tol || goldbergerErr >= tol) {
+      valid = false;
+    }
+  }
+
+  return {
+    valid,
+    maxEinthovenErr: Number(maxEinthovenErr.toFixed(6)),
+    maxGoldbergerErr: Number(maxGoldbergerErr.toFixed(6)),
+  };
+};
+
+/**
+ * Helper to process a single raw channel through Steps 2, 3, and 4
+ */
+export const processRawChannel = (channel, settleSamples = 125, windowSize = 250, k = 6) => {
+  if (!Array.isArray(channel) || channel.length === 0) return { cleaned: [], spikeCount: 0 };
+
+  // Step 2: Settling-window trim
+  const trimmed = trimSettling(channel, settleSamples);
+
+  // Step 3: MAD Outlier despike
+  const { cleaned: despiked, spikeCount } = despikeChannel(trimmed, 5, k);
+
+  // Step 4: Baseline correction
+  const baseCorrected = removeBaseline(despiked, windowSize);
+
+  return { cleaned: baseCorrected, spikeCount };
 };
 
 // Helper function to calculate derived limb leads and interpolate any missing chest lead (V1..V6)
-const ensureAll12LeadsPresent = (testDoc) => {
-  if (!testDoc) return;
+const ensureAll12LeadsPresent = (testDoc, settleSamples = 125, kThreshold = 6) => {
+  if (!testDoc) return { success: false, message: "Missing test document" };
   if (!testDoc.leads) testDoc.leads = {};
 
   const rawL1 = testDoc.leads.L1 || [];
   const rawL2 = testDoc.leads.L2 || [];
 
-  if (rawL1.length === 0 || rawL2.length === 0) return;
+  // Step 1: Pre-validation
+  const validation = validateInputs(rawL1, rawL2);
+  if (!validation.valid) {
+    testDoc.status = "alignment_error";
+    return { success: false, ...validation };
+  }
 
-  const minRawLen = Math.min(rawL1.length, rawL2.length);
-  const settlingCount = Math.min(125, Math.floor(minRawLen * 0.1));
+  // Steps 2 - 4: Process raw L1 and L2 through trim, despike, and baseline removal
+  const { cleaned: L1_clean, spikeCount: L1_spikes } = processRawChannel(rawL1, settleSamples, 250, kThreshold);
+  const { cleaned: L2_clean, spikeCount: L2_spikes } = processRawChannel(rawL2, settleSamples, 250, kThreshold);
 
-  // Steps 1-3: Clean raw L1 and L2 channels independently with matched parameters
-  const L1_clean = cleanRawChannel(rawL1, settlingCount);
-  const L2_clean = cleanRawChannel(rawL2, settlingCount);
-
-  // Step 4: Verify sample-level synchronization across channels
+  // Step 5: Sample-sync verification
   const minLen = Math.min(L1_clean.length, L2_clean.length);
-  if (minLen <= 0) return;
+  if (minLen <= 0) {
+    testDoc.status = "alignment_error";
+    return { success: false, message: "Sample synchronization failed: empty data after settling trim", code: "empty_after_trim" };
+  }
 
-  const L1 = L1_clean.slice(0, minLen);
-  const L2 = L2_clean.slice(0, minLen);
+  const L1 = L1_clean.slice(0, minLen).map((v) => Number(v.toFixed(4)));
+  const L2 = L2_clean.slice(0, minLen).map((v) => Number(v.toFixed(4)));
 
-  testDoc.leads.L1 = L1.map((v) => Number(v.toFixed(4)));
-  testDoc.leads.L2 = L2.map((v) => Number(v.toFixed(4)));
+  testDoc.leads.L1 = L1;
+  testDoc.leads.L2 = L2;
 
-  // Clean chest leads (V1..V6) if present
+  // Process chest leads (V1..V6) if present
   const chestKeys = ["V1", "V2", "V3", "V4", "V5", "V6"];
   chestKeys.forEach((key) => {
     if (Array.isArray(testDoc.leads[key]) && testDoc.leads[key].length > 0) {
-      const cleaned = cleanRawChannel(testDoc.leads[key], settlingCount);
+      const { cleaned } = processRawChannel(testDoc.leads[key], settleSamples, 250, kThreshold);
       testDoc.leads[key] = cleaned.slice(0, minLen).map((v) => Number(v.toFixed(4)));
     }
   });
 
-  // Step 5: Calculate derived limb leads: Lead III, aVR, aVL, aVF
-  const L3_data = [];
-  const aVR_data = [];
-  const aVL_data = [];
-  const aVF_data = [];
+  // Step 6: Derive the 4 leads (L3, aVR, aVL, aVF)
+  const { L3, aVR, aVL, aVF } = deriveLeads(L1, L2);
+  testDoc.leads.L3 = L3;
+  testDoc.leads.aVR = aVR;
+  testDoc.leads.aVL = aVL;
+  testDoc.leads.aVF = aVF;
 
-  for (let i = 0; i < minLen; i++) {
-    const l1 = testDoc.leads.L1[i];
-    const l2 = testDoc.leads.L2[i];
+  // Step 7: Post-derivation automated validation gate
+  const derivationReport = validateDerivation(L1, L2, L3, aVR, aVL, aVF, 1.0);
+  console.log(`[12-Lead Step 7 Validation Gate] Samples: ${minLen}, Einthoven Max Err: ${derivationReport.maxEinthovenErr}, Goldberger Max Err: ${derivationReport.maxGoldbergerErr}, Valid: ${derivationReport.valid}`);
 
-    const l3 = l2 - l1;
-    const avr = -(l1 + l2) / 2;
-    const avl = l1 - (l2 / 2);
-    const avf = l2 - (l1 / 2);
-
-    L3_data.push(Number(l3.toFixed(4)));
-    aVR_data.push(Number(avr.toFixed(4)));
-    aVL_data.push(Number(avl.toFixed(4)));
-    aVF_data.push(Number(avf.toFixed(4)));
+  if (!derivationReport.valid) {
+    testDoc.status = "failed";
+    return { success: false, message: "Post-derivation validation gate failed", derivationReport };
   }
-
-  testDoc.leads.L3 = L3_data;
-  testDoc.leads.aVR = aVR_data;
-  testDoc.leads.aVL = aVL_data;
-  testDoc.leads.aVF = aVF_data;
-
-  // Step 6: Sanity checks (Einthoven's triangle & Goldberger identity)
-  let maxEinthovenErr = 0;
-  let maxGoldbergerErr = 0;
-  for (let i = 0; i < minLen; i++) {
-    const einthovenErr = Math.abs(testDoc.leads.L1[i] + testDoc.leads.L3[i] - testDoc.leads.L2[i]);
-    const goldbergerErr = Math.abs(testDoc.leads.aVR[i] + testDoc.leads.aVL[i] + testDoc.leads.aVF[i]);
-    if (einthovenErr > maxEinthovenErr) maxEinthovenErr = einthovenErr;
-    if (goldbergerErr > maxGoldbergerErr) maxGoldbergerErr = goldbergerErr;
-  }
-  console.log(`[12-Lead Sanity Check] Samples: ${minLen}, Max Einthoven error: ${maxEinthovenErr.toFixed(6)}, Max Goldberger error: ${maxGoldbergerErr.toFixed(6)}`);
 
   // Helpers to inspect and interpolate missing chest lead arrays
   const getValidChestLead = (leadKey) => {
@@ -713,7 +753,7 @@ const ensureAll12LeadsPresent = (testDoc) => {
     testDoc.leads.V6 = getValidChestLead("V5") || getValidChestLead("V4") || testDoc.leads.L2;
   }
 
-  // Mark all 12 lead names in completedLeads and deduplicate
+  // Step 8: Mark completed and update completedLeads
   const ALL_12_LEAD_NAMES = ["L1", "L2", "L3", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"];
   if (!Array.isArray(testDoc.completedLeads)) {
     testDoc.completedLeads = [];
@@ -728,6 +768,14 @@ const ensureAll12LeadsPresent = (testDoc) => {
   testDoc.totalLeads = 12;
   testDoc.status = "completed";
   testDoc.completedAt = new Date();
+
+  return {
+    success: true,
+    totalLeads: 12,
+    sampleCount: minLen,
+    spikes: { L1: L1_spikes, L2: L2_spikes },
+    derivationReport,
+  };
 };
 
 // @desc    Store new ECG data from device
@@ -2047,7 +2095,7 @@ export const streamActiveLiveUsers = async (req, res) => {
 // @access  Public
 export const generateTwelveLeadEcg = async (req, res) => {
   try {
-    const { deviceId, userId, testId } = req.body;
+    const { deviceId, userId, testId, settleSamples, kThreshold } = req.body;
 
     if (!deviceId && !userId && !testId) {
       return res.status(400).json({
@@ -2075,20 +2123,23 @@ export const generateTwelveLeadEcg = async (req, res) => {
       });
     }
 
-    const L1_data = testDoc.leads.L1 || [];
-    const L2_data = testDoc.leads.L2 || [];
+    const parseSettle = Number.isInteger(settleSamples) && settleSamples >= 0 ? settleSamples : 125;
+    const parseK = typeof kThreshold === "number" && kThreshold > 0 ? kThreshold : 6;
 
-    if (L1_data.length === 0 || L2_data.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Both Lead I (L1) and Lead II (L2) data are required to generate derived leads",
-      });
-    }
-
-    ensureAll12LeadsPresent(testDoc);
+    const pipelineResult = ensureAll12LeadsPresent(testDoc, parseSettle, parseK);
 
     testDoc.markModified("leads");
     await testDoc.save();
+
+    if (!pipelineResult.success) {
+      return res.status(400).json({
+        success: false,
+        status: testDoc.status,
+        message: pipelineResult.message || "12-lead ECG derivation failed",
+        code: pipelineResult.code || "derivation_error",
+        testId: testDoc._id,
+      });
+    }
 
     // Clear active lead session map for this device/user
     if (testDoc.deviceId && testDoc.userId) {
@@ -2098,9 +2149,13 @@ export const generateTwelveLeadEcg = async (req, res) => {
 
     return res.status(200).json({
       success: true,
+      status: testDoc.status,
       completed: true,
       totalLeads: 12,
       testId: testDoc._id,
+      sampleCount: pipelineResult.sampleCount,
+      spikes: pipelineResult.spikes,
+      validation: pipelineResult.derivationReport,
       leads: {
         L1: testDoc.leads.L1,
         L2: testDoc.leads.L2,
