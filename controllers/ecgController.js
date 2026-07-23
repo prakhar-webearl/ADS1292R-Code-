@@ -502,7 +502,7 @@ const getMAD = (arr) => {
  */
 const cleanArraySpikes = (arr, leadName = "unknown") => {
   if (!Array.isArray(arr) || arr.length === 0) return [];
-  
+
   const medianVal = getMedian(arr);
   const madVal = getMAD(arr);
   const maxAllowedDev = Math.max(2500, 5 * madVal);
@@ -541,7 +541,7 @@ const trimSettlingWindow = (arr, sr = 250) => {
   if (!Array.isArray(arr) || arr.length === 0) return [];
   const sampleRate = typeof sr === "number" && sr > 0 ? sr : 250;
   const trimSamples = Math.round(SETTLING_TRIM_SECONDS * sampleRate);
-  
+
   if (arr.length <= trimSamples + 50) return arr;
   return arr.slice(trimSamples);
 };
@@ -645,7 +645,7 @@ const calculate12LeadInterpretation = (leads, sr = 250) => {
   const sampleRate = typeof sr === "number" && sr > 0 ? sr : 250;
   const meanVal = primarySignal.reduce((a, b) => a + b, 0) / primarySignal.length;
   const centered = primarySignal.map((v) => v - meanVal);
-  
+
   const variance = centered.reduce((s, v) => s + v * v, 0) / centered.length;
   const sigma = Math.sqrt(variance);
   let maxV = Math.max(...centered);
@@ -734,6 +734,97 @@ const calculate12LeadInterpretation = (leads, sr = 250) => {
       qualityScore: rPeaks.length >= 3 ? 95 : 75,
     },
   };
+};
+
+/**
+ * Deduplicated Session Helper: Ensures ONE AND ONLY ONE active "collecting" 
+ * TwelveLeadEcg document exists per deviceId/userId, eliminating race condition 
+ * duplicate document creation and purging abandoned scratch sessions.
+ */
+const getOrCreateActiveTwelveLeadSession = async (deviceId, userId, sr = 250) => {
+  const normDeviceId = String(deviceId || "").trim();
+  const normUserId = String(userId || "").trim();
+
+  if (!normDeviceId && !normUserId) return null;
+
+  // 1. Purge or finalize stale collecting sessions older than 5 minutes
+  const fiveMinsAgo = new Date(Date.now() - 5 * 60 * 1000);
+  
+  // Delete abandoned collecting sessions with fewer than 2 completed leads
+  await TwelveLeadEcg.deleteMany({
+    $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
+    status: "collecting",
+    createdAt: { $lt: fiveMinsAgo },
+    $or: [
+      { completedLeads: { $size: 0 } },
+      { completedLeads: { $size: 1 } },
+      { completedLeads: { $exists: false } },
+    ],
+  });
+
+  // Finalize any stale collecting sessions that have at least L1 & L2
+  const staleValidDocs = await TwelveLeadEcg.find({
+    $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
+    status: "collecting",
+    createdAt: { $lt: fiveMinsAgo },
+  });
+
+  for (let doc of staleValidDocs) {
+    ensureAll12LeadsPresent(doc);
+    doc.status = "completed";
+    doc.markModified("leads");
+    await doc.save();
+  }
+
+  // 2. Find any active collecting session for this device or user
+  const query = {};
+  if (normDeviceId && normUserId) {
+    query.$or = [
+      { deviceId: normDeviceId, userId: normUserId, status: "collecting" },
+      { deviceId: normDeviceId, status: "collecting" },
+      { userId: normUserId, status: "collecting" },
+    ];
+  } else if (normDeviceId) {
+    query.deviceId = normDeviceId;
+    query.status = "collecting";
+  } else {
+    query.userId = normUserId;
+    query.status = "collecting";
+  }
+
+  const allCollecting = await TwelveLeadEcg.find(query).sort({ createdAt: -1 });
+
+  let activeTest = null;
+  if (allCollecting.length > 0) {
+    activeTest = allCollecting[0];
+    if (allCollecting.length > 1) {
+      const duplicateIds = allCollecting.slice(1).map((doc) => doc._id);
+      console.warn(
+        `[12-Lead Session Deduplicator] Found ${allCollecting.length} duplicate active collecting documents. ` +
+        `Consolidating into document ${activeTest._id} and removing duplicate IDs: ${duplicateIds.join(", ")}`
+      );
+      await TwelveLeadEcg.deleteMany({ _id: { $in: duplicateIds } });
+    }
+  }
+
+  if (!activeTest) {
+    try {
+      activeTest = await TwelveLeadEcg.create({
+        userId: normUserId,
+        deviceId: normDeviceId,
+        sr: typeof sr === "number" ? sr : 250,
+        status: "collecting",
+        completedLeads: [],
+        totalLeads: 0,
+        leads: {},
+      });
+    } catch (createErr) {
+      // Race condition safety fallback
+      activeTest = await TwelveLeadEcg.findOne(query).sort({ createdAt: -1 });
+    }
+  }
+
+  return activeTest;
 };
 
 // Helper function to calculate derived limb leads and interpolate any missing chest lead (V1..V6)
@@ -1066,24 +1157,11 @@ export const storeEcgData = async (req, res) => {
 
     if (currentLead) {
       try {
-        let activeTest = await TwelveLeadEcg.findOne({
-          $or: [
-            { deviceId: normalizedDeviceId, status: "collecting" },
-            { userId: effectiveUserId, status: "collecting" },
-          ],
-        }).sort({ createdAt: -1 });
-
-        if (!activeTest) {
-          activeTest = await TwelveLeadEcg.create({
-            userId: effectiveUserId,
-            deviceId: normalizedDeviceId,
-            sr: typeof sr === "number" ? sr : 250,
-            status: "collecting",
-            completedLeads: [],
-            totalLeads: 0,
-            leads: {},
-          });
-        }
+        let activeTest = await getOrCreateActiveTwelveLeadSession(
+          normalizedDeviceId,
+          effectiveUserId,
+          sr
+        );
 
         if (activeTest && activeTest.status === "collecting") {
           const sampleRate = typeof sr === "number" && sr > 0 ? sr : (activeTest.sr || 250);
@@ -1122,7 +1200,7 @@ export const storeEcgData = async (req, res) => {
 
           // Trigger derived lead calculation (L3, aVR, aVL, aVF) whenever L1 & L2 have data
           const hasL1AndL2 = Array.isArray(activeTest.leads.L1) && activeTest.leads.L1.length >= 50 &&
-                             Array.isArray(activeTest.leads.L2) && activeTest.leads.L2.length >= 50;
+            Array.isArray(activeTest.leads.L2) && activeTest.leads.L2.length >= 50;
 
           if (hasL1AndL2) {
             ensureAll12LeadsPresent(activeTest);
@@ -2328,12 +2406,35 @@ export const setLeadSession = async (req, res) => {
 
     activeLeadSessions.set(key, normalizedLead);
 
-    // Ensure active collecting 12-lead document exists
-    let testDoc = await TwelveLeadEcg.findOne({
-      deviceId: String(deviceId).trim(),
-      userId: String(userId).trim(),
-      status: "collecting",
-    }).sort({ createdAt: -1 });
+    // Ensure single active collecting 12-lead document exists
+    const normDeviceId = String(deviceId).trim();
+    const normUserId = String(userId).trim();
+
+    // If starting fresh test on Lead I (L1), purge any abandoned scratch collecting documents
+    if (normalizedLead === "L1") {
+      await TwelveLeadEcg.deleteMany({
+        $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
+        status: "collecting",
+        $or: [
+          { completedLeads: { $size: 0 } },
+          { completedLeads: { $size: 1 } },
+          { completedLeads: { $exists: false } },
+        ],
+      });
+
+      // Complete any existing collecting documents that had valid leads
+      const prevCollecting = await TwelveLeadEcg.find({
+        $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
+        status: "collecting",
+      });
+      for (let prevDoc of prevCollecting) {
+        ensureAll12LeadsPresent(prevDoc);
+        prevDoc.status = "completed";
+        await prevDoc.save();
+      }
+    }
+
+    let testDoc = await getOrCreateActiveTwelveLeadSession(normDeviceId, normUserId);
 
     if (!testDoc) {
       testDoc = await TwelveLeadEcg.create({
