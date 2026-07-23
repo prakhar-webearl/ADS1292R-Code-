@@ -747,12 +747,12 @@ const getOrCreateActiveTwelveLeadSession = async (deviceId, userId, sr = 250, cr
 
   if (!normDeviceId && !normUserId) return null;
 
-  // 1. Auto-purge abandoned scratch collecting documents (updated > 60s ago with < 2 leads)
-  const oneMinAgo = new Date(Date.now() - 60 * 1000);
+  // 1. Auto-purge abandoned scratch collecting documents (updated > 5 minutes ago with < 2 leads)
+  const fiveMinsAgo = new Date(Date.now() - 5 * 60 * 1000);
   await TwelveLeadEcg.deleteMany({
     $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
     status: "collecting",
-    updatedAt: { $lt: oneMinAgo },
+    updatedAt: { $lt: fiveMinsAgo },
     $or: [
       { completedLeads: { $size: 0 } },
       { completedLeads: { $size: 1 } },
@@ -760,12 +760,12 @@ const getOrCreateActiveTwelveLeadSession = async (deviceId, userId, sr = 250, cr
     ],
   });
 
-  // Finalize any stale collecting sessions that have at least L1 & L2 (older than 3 minutes)
-  const threeMinsAgo = new Date(Date.now() - 3 * 60 * 1000);
+  // Finalize any stale collecting sessions that have at least L1 & L2 (older than 10 minutes)
+  const tenMinsAgo = new Date(Date.now() - 10 * 60 * 1000);
   const staleValidDocs = await TwelveLeadEcg.find({
     $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
     status: "collecting",
-    createdAt: { $lt: threeMinsAgo },
+    createdAt: { $lt: tenMinsAgo },
   });
 
   for (let doc of staleValidDocs) {
@@ -893,17 +893,6 @@ const ensureAll12LeadsPresent = (testDoc) => {
     testDoc.leads.aVF = aVF_data;
   }
 
-  // Helpers to inspect, clean, trim, and interpolate chest lead arrays
-  const getValidChestLead = (leadKey) => {
-    const rawArr = testDoc.leads[leadKey];
-    if (!Array.isArray(rawArr) || rawArr.length === 0) return null;
-    const trimmed = trimSettlingWindow(rawArr, sr);
-    const cleaned = cleanArraySpikes(trimmed, leadKey);
-    const detrended = detrendSignal(cleaned, sr);
-    testDoc.leads[leadKey] = detrended;
-    return detrended;
-  };
-
   const interpolateLeads = (arrA, arrB) => {
     if (!arrA && !arrB) return null;
     if (!arrA) return arrB;
@@ -916,38 +905,61 @@ const ensureAll12LeadsPresent = (testDoc) => {
     return result;
   };
 
-  // 2. Guarantee chest leads V1..V6 are populated. If any chest lead is missing, interpolate or fallback!
-  if (!getValidChestLead("V1")) {
-    testDoc.leads.V1 = getValidChestLead("V2") || getValidChestLead("V3") || L1_aligned;
+  // 2. Clean, trim, and detrend existing raw chest lead arrays (V1..V6)
+  const chestLeadKeys = ["V1", "V2", "V3", "V4", "V5", "V6"];
+  const processedChestLeads = {};
+
+  for (const key of chestLeadKeys) {
+    const rawArr = testDoc.leads[key];
+    if (Array.isArray(rawArr) && rawArr.length > 0) {
+      const trimmed = trimSettlingWindow(rawArr, sr);
+      const cleaned = cleanArraySpikes(trimmed, key);
+      const detrended = detrendSignal(cleaned, sr);
+      processedChestLeads[key] = detrended;
+      testDoc.leads[key] = detrended;
+    } else {
+      processedChestLeads[key] = null;
+    }
   }
-  if (!getValidChestLead("V2")) {
-    testDoc.leads.V2 = getValidChestLead("V1") || getValidChestLead("V3") || L1_aligned;
+
+  // Populate any missing chest leads using interpolation / fallback
+  if (!processedChestLeads.V1) {
+    testDoc.leads.V1 = processedChestLeads.V2 || processedChestLeads.V3 || L1_aligned;
+    processedChestLeads.V1 = testDoc.leads.V1;
   }
-  if (!getValidChestLead("V3")) {
+  if (!processedChestLeads.V2) {
+    testDoc.leads.V2 = processedChestLeads.V1 || processedChestLeads.V3 || L1_aligned;
+    processedChestLeads.V2 = testDoc.leads.V2;
+  }
+  if (!processedChestLeads.V3) {
     testDoc.leads.V3 =
-      interpolateLeads(getValidChestLead("V2"), getValidChestLead("V4")) ||
-      getValidChestLead("V2") ||
-      getValidChestLead("V4") ||
-      getValidChestLead("V1") ||
+      interpolateLeads(processedChestLeads.V2, processedChestLeads.V4) ||
+      processedChestLeads.V2 ||
+      processedChestLeads.V4 ||
+      processedChestLeads.V1 ||
       L1_aligned;
+    processedChestLeads.V3 = testDoc.leads.V3;
   }
-  if (!getValidChestLead("V4")) {
+  if (!processedChestLeads.V4) {
     testDoc.leads.V4 =
-      interpolateLeads(getValidChestLead("V3"), getValidChestLead("V5")) ||
-      getValidChestLead("V3") ||
-      getValidChestLead("V5") ||
-      getValidChestLead("V6") ||
+      interpolateLeads(processedChestLeads.V3, processedChestLeads.V5) ||
+      processedChestLeads.V3 ||
+      processedChestLeads.V5 ||
+      processedChestLeads.V6 ||
       L2_aligned;
+    processedChestLeads.V4 = testDoc.leads.V4;
   }
-  if (!getValidChestLead("V5")) {
+  if (!processedChestLeads.V5) {
     testDoc.leads.V5 =
-      interpolateLeads(getValidChestLead("V4"), getValidChestLead("V6")) ||
-      getValidChestLead("V4") ||
-      getValidChestLead("V6") ||
+      interpolateLeads(processedChestLeads.V4, processedChestLeads.V6) ||
+      processedChestLeads.V4 ||
+      processedChestLeads.V6 ||
       L2_aligned;
+    processedChestLeads.V5 = testDoc.leads.V5;
   }
-  if (!getValidChestLead("V6")) {
-    testDoc.leads.V6 = getValidChestLead("V5") || getValidChestLead("V4") || L2_aligned;
+  if (!processedChestLeads.V6) {
+    testDoc.leads.V6 = processedChestLeads.V5 || processedChestLeads.V4 || L2_aligned;
+    processedChestLeads.V6 = testDoc.leads.V6;
   }
 
   // Bug 4: Downstream AI Interpretation & Interval Parameter Calculation consuming CLEANED leads
@@ -1199,11 +1211,21 @@ export const storeEcgData = async (req, res) => {
 
           activeTest.completedLeads = Array.from(new Set(activeTest.completedLeads));
 
-          // Trigger derived lead calculation (L3, aVR, aVL, aVF) whenever L1 & L2 have data
-          const hasL1AndL2 = Array.isArray(activeTest.leads.L1) && activeTest.leads.L1.length >= 50 &&
-            Array.isArray(activeTest.leads.L2) && activeTest.leads.L2.length >= 50;
+          // Auto-finalize 12-lead report ONLY when all recorded leads have reached full target sample count
+          const isL1Complete = Array.isArray(activeTest.leads.L1) && activeTest.leads.L1.length >= maxTargetSamples;
+          const isL2Complete = Array.isArray(activeTest.leads.L2) && activeTest.leads.L2.length >= maxTargetSamples;
+          const allEightPhysicalLeads = ["L1", "L2", "V1", "V2", "V3", "V4", "V5", "V6"];
+          const hasAllEightLeads = allEightPhysicalLeads.every((l) =>
+            Array.isArray(activeTest.leads[l]) && activeTest.leads[l].length >= maxTargetSamples
+          );
 
-          if (hasL1AndL2) {
+          // Check if 2-lead mode (only L1 & L2 recorded, no chest leads captured)
+          const hasNoChestLeads = !["V1", "V2", "V3", "V4", "V5", "V6"].some(
+            (l) => Array.isArray(activeTest.leads[l]) && activeTest.leads[l].length > 0
+          );
+          const isTwoLeadModeComplete = isL1Complete && isL2Complete && hasNoChestLeads;
+
+          if (hasAllEightLeads || isTwoLeadModeComplete) {
             ensureAll12LeadsPresent(activeTest);
           }
 
