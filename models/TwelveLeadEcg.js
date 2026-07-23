@@ -43,6 +43,19 @@ const twelveLeadEcgSchema = new mongoose.Schema(
       V5: { type: [Number], default: [] },
       V6: { type: [Number], default: [] },
     },
+    metrics: {
+      prIntervalMs: { type: Number, default: null },
+      qrsIntervalMs: { type: Number, default: null },
+      qtIntervalMs: { type: Number, default: null },
+      qtcIntervalMs: { type: Number, default: null },
+      heartRateBpm: { type: Number, default: null },
+    },
+    interpretation: {
+      status: { type: String, default: 'Normal Sinus Rhythm' },
+      reasons: { type: [String], default: [] },
+      qualityLabel: { type: String, default: 'Good' },
+      qualityScore: { type: Number, default: 95 },
+    },
     completedAt: {
       type: Date,
     },

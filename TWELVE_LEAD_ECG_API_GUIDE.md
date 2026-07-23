@@ -1,6 +1,6 @@
 # 12-Lead ECG API Integration Guide
 
-This document explains how your **Hardware / Mobile App** records 8 seconds of data per physical lead (`L1`, `L2`, `V1`..`V6`) and automatically generates the complete 12-Lead ECG report.
+This document explains how your **Hardware / Mobile App** records 8 seconds of data per physical lead (`L1`, `L2`, `V1`..`V6`) and automatically generates the complete 12-Lead ECG report with **sample sanitization, startup settling window trimming, moving-average baseline detrending, and unified AI interpretation**.
 
 ---
 
@@ -19,13 +19,16 @@ This document explains how your **Hardware / Mobile App** records 8 seconds of d
 3. **Repeat for Chest Leads (V1, V2, V3, V4, V5, V6)**:
    - For each lead (`V1` to `V6`), app sets lead session, patient moves electrodes, device streams 8s data.
 
-4. **Automatic Calculation on Final Lead Arrival**:
-   - As soon as the 8th physical lead (`V6`) completes its 8 seconds of data, the backend **automatically calculates** the 4 derived limb leads:
+4. **Automatic Cleaning & Calculation on Final Lead Arrival**:
+   - **Spike Sanitization (Bug 1 Fix)**: Rejects single-sample corruption (>5x MAD or magnitude > `MAX_PLAUSIBLE_ADC_MAGNITUDE`) and replaces with last known-good value.
+   - **Settling Window Trim (Bug 3 Fix)**: Trims the first ~0.3s startup settling transient before math operations.
+   - **Baseline Detrending (Bug 2 & 3 Fix)**: Moving-average baseline subtraction (~0.2s window) removes low-frequency drift.
+   - **Derived Limb Lead Math**:
      - **Lead III**: $\text{Lead II} - \text{Lead I}$
      - **aVR**: $-\frac{\text{Lead I} + \text{Lead II}}{2}$
      - **aVL**: $\text{Lead I} - \frac{\text{Lead II}}{2}$
      - **aVF**: $\text{Lead II} - \frac{\text{Lead I}}{2}$
-   - Stores all 12 leads into the database and marks `status: "completed"`.
+   - **Unified Interpretation (Bug 4 Fix)**: Calculates PR, QRS, QT, QTc, HR, and Ischemia assessment consuming the **exact same cleaned, detrended, trimmed leads**.
 
 ---
 
@@ -61,17 +64,32 @@ This document explains how your **Hardware / Mobile App** records 8 seconds of d
 ---
 
 ### 2.3 Fetch / Generate Latest 12-Lead Report
-- **Endpoint:** `POST /api/ecg/generate-12-lead` or `GET /api/ecg/generate-12-lead` or `GET /api/ecg/12-lead/latest`
-- **GET Request:** `GET /api/ecg/generate-12-lead?deviceId=ESP32_001&userId=user123`
-- **Description:** Returns the **absolute latest** 12-lead report for the given `deviceId` and `userId` (sorted by `{ _id: -1, updatedAt: -1 }`).
+- **Endpoint:** `POST /api/ecg/generate-12-lead` or `GET /api/ecg/12-lead/list/:userId`
+- **Request Body:** `POST /api/ecg/generate-12-lead` `{ "deviceId": "ESP32_001", "userId": "user123" }`
+- **Description:** Returns the **absolute latest** 12-lead report for the given `deviceId` and `userId` (sorted by `{ _id: -1 }`).
 
-#### Response Payload (All 12 Leads - Guaranteed Latest Document)
+#### Response Payload (All 12 Leads + Metrics + Interpretation)
 ```json
 {
   "success": true,
   "completed": true,
   "totalLeads": 12,
   "testId": "69ca740bfa123456789abcde",
+  "metrics": {
+    "prIntervalMs": 150,
+    "qrsIntervalMs": 90,
+    "qtIntervalMs": 380,
+    "qtcIntervalMs": 410,
+    "heartRateBpm": 72
+  },
+  "interpretation": {
+    "status": "Normal Sinus Rhythm",
+    "reasons": [
+      "Normal P-QRS-T wave pattern and baseline stability"
+    ],
+    "qualityLabel": "Good",
+    "qualityScore": 95
+  },
   "leads": {
     "L1": [ ... 8s data ... ],
     "L2": [ ... 8s data ... ],
