@@ -741,20 +741,18 @@ const calculate12LeadInterpretation = (leads, sr = 250) => {
  * TwelveLeadEcg document exists per deviceId/userId, eliminating race condition 
  * duplicate document creation and purging abandoned scratch sessions.
  */
-const getOrCreateActiveTwelveLeadSession = async (deviceId, userId, sr = 250) => {
+const getOrCreateActiveTwelveLeadSession = async (deviceId, userId, sr = 250, createIfNotFound = true) => {
   const normDeviceId = String(deviceId || "").trim();
   const normUserId = String(userId || "").trim();
 
   if (!normDeviceId && !normUserId) return null;
 
-  // 1. Purge or finalize stale collecting sessions older than 3 minutes
-  const threeMinsAgo = new Date(Date.now() - 3 * 60 * 1000);
-  
-  // Delete abandoned collecting sessions with fewer than 2 completed leads
+  // 1. Auto-purge abandoned scratch collecting documents (updated > 60s ago with < 2 leads)
+  const oneMinAgo = new Date(Date.now() - 60 * 1000);
   await TwelveLeadEcg.deleteMany({
     $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
     status: "collecting",
-    createdAt: { $lt: threeMinsAgo },
+    updatedAt: { $lt: oneMinAgo },
     $or: [
       { completedLeads: { $size: 0 } },
       { completedLeads: { $size: 1 } },
@@ -762,7 +760,8 @@ const getOrCreateActiveTwelveLeadSession = async (deviceId, userId, sr = 250) =>
     ],
   });
 
-  // Finalize any stale collecting sessions that have at least L1 & L2
+  // Finalize any stale collecting sessions that have at least L1 & L2 (older than 3 minutes)
+  const threeMinsAgo = new Date(Date.now() - 3 * 60 * 1000);
   const staleValidDocs = await TwelveLeadEcg.find({
     $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
     status: "collecting",
@@ -807,7 +806,7 @@ const getOrCreateActiveTwelveLeadSession = async (deviceId, userId, sr = 250) =>
     }
   }
 
-  if (!activeTest) {
+  if (!activeTest && createIfNotFound) {
     try {
       activeTest = await TwelveLeadEcg.create({
         userId: normUserId,
@@ -1157,10 +1156,12 @@ export const storeEcgData = async (req, res) => {
 
     if (currentLead) {
       try {
+        const isExplicitSessionActive = Boolean(activeLeadSessions.has(key) || mode);
         let activeTest = await getOrCreateActiveTwelveLeadSession(
           normalizedDeviceId,
           effectiveUserId,
-          sr
+          sr,
+          isExplicitSessionActive
         );
 
         if (activeTest && activeTest.status === "collecting") {
