@@ -747,14 +747,14 @@ const getOrCreateActiveTwelveLeadSession = async (deviceId, userId, sr = 250) =>
 
   if (!normDeviceId && !normUserId) return null;
 
-  // 1. Purge or finalize stale collecting sessions older than 5 minutes
-  const fiveMinsAgo = new Date(Date.now() - 5 * 60 * 1000);
+  // 1. Purge or finalize stale collecting sessions older than 3 minutes
+  const threeMinsAgo = new Date(Date.now() - 3 * 60 * 1000);
   
   // Delete abandoned collecting sessions with fewer than 2 completed leads
   await TwelveLeadEcg.deleteMany({
     $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
     status: "collecting",
-    createdAt: { $lt: fiveMinsAgo },
+    createdAt: { $lt: threeMinsAgo },
     $or: [
       { completedLeads: { $size: 0 } },
       { completedLeads: { $size: 1 } },
@@ -766,7 +766,7 @@ const getOrCreateActiveTwelveLeadSession = async (deviceId, userId, sr = 250) =>
   const staleValidDocs = await TwelveLeadEcg.find({
     $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
     status: "collecting",
-    createdAt: { $lt: fiveMinsAgo },
+    createdAt: { $lt: threeMinsAgo },
   });
 
   for (let doc of staleValidDocs) {
@@ -2303,12 +2303,21 @@ export const generateTwelveLeadEcg = async (req, res) => {
     if (testId && mongoose.Types.ObjectId.isValid(testId)) {
       testDoc = await TwelveLeadEcg.findById(testId);
     } else {
-      const query = {};
-      if (deviceId) query.deviceId = String(deviceId).trim();
-      if (userId) query.userId = String(userId).trim();
+      const baseQuery = {};
+      if (deviceId) baseQuery.deviceId = String(deviceId).trim();
+      if (userId) baseQuery.userId = String(userId).trim();
 
-      // Fetch the latest report for this device/user sorted by _id descending (newest first)
-      testDoc = await TwelveLeadEcg.findOne(query).sort({ _id: -1 });
+      // Prefer the latest document for this device/user that has both Lead I and Lead II recorded
+      testDoc = await TwelveLeadEcg.findOne({
+        ...baseQuery,
+        "leads.L1.0": { $exists: true },
+        "leads.L2.0": { $exists: true },
+      }).sort({ _id: -1 });
+
+      // Fallback if not found: find any latest document for this device/user
+      if (!testDoc) {
+        testDoc = await TwelveLeadEcg.findOne(baseQuery).sort({ _id: -1 });
+      }
     }
 
     if (!testDoc) {
@@ -2406,33 +2415,9 @@ export const setLeadSession = async (req, res) => {
 
     activeLeadSessions.set(key, normalizedLead);
 
-    // Ensure single active collecting 12-lead document exists
+    // Ensure single active collecting 12-lead document exists for deviceId / userId
     const normDeviceId = String(deviceId).trim();
     const normUserId = String(userId).trim();
-
-    // If starting fresh test on Lead I (L1), purge any abandoned scratch collecting documents
-    if (normalizedLead === "L1") {
-      await TwelveLeadEcg.deleteMany({
-        $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
-        status: "collecting",
-        $or: [
-          { completedLeads: { $size: 0 } },
-          { completedLeads: { $size: 1 } },
-          { completedLeads: { $exists: false } },
-        ],
-      });
-
-      // Complete any existing collecting documents that had valid leads
-      const prevCollecting = await TwelveLeadEcg.find({
-        $or: [{ deviceId: normDeviceId }, { userId: normUserId }],
-        status: "collecting",
-      });
-      for (let prevDoc of prevCollecting) {
-        ensureAll12LeadsPresent(prevDoc);
-        prevDoc.status = "completed";
-        await prevDoc.save();
-      }
-    }
 
     let testDoc = await getOrCreateActiveTwelveLeadSession(normDeviceId, normUserId);
 
@@ -2481,7 +2466,14 @@ export const getTwelveLeadEcgList = async (req, res) => {
     const { userId } = req.params;
     const { deviceId, limit = 20, page = 1 } = req.query;
 
-    const query = {};
+    // Exclude incomplete scratch collecting documents with fewer than 2 completed leads
+    const query = {
+      $or: [
+        { status: "completed" },
+        { totalLeads: { $gte: 2 } },
+        { "leads.L2.0": { $exists: true } }
+      ]
+    };
     if (userId) query.userId = String(userId).trim();
     if (deviceId) query.deviceId = String(deviceId).trim();
 
@@ -2489,19 +2481,33 @@ export const getTwelveLeadEcgList = async (req, res) => {
     const skipNum = Math.max(0, (parseInt(page) - 1) * limitNum);
 
     // Fetch reports sorted by _id descending (latest report first)
-    const reports = await TwelveLeadEcg.find(query)
+    const rawReports = await TwelveLeadEcg.find(query)
       .sort({ _id: -1 })
       .skip(skipNum)
-      .limit(limitNum);
+      .limit(limitNum * 2);
+
+    // Deduplicate reports created within 60s of each other for same device/user
+    const uniqueReports = [];
+    const seenTimes = [];
+
+    for (let rep of rawReports) {
+      const timeMs = new Date(rep.createdAt || rep.completedAt || 0).getTime();
+      const isDup = seenTimes.some((t) => Math.abs(t - timeMs) < 60000);
+      if (!isDup) {
+        uniqueReports.push(rep);
+        seenTimes.push(timeMs);
+      }
+      if (uniqueReports.length >= limitNum) break;
+    }
 
     const totalCount = await TwelveLeadEcg.countDocuments(query);
 
     return res.status(200).json({
       success: true,
-      count: reports.length,
+      count: uniqueReports.length,
       totalCount,
       page: parseInt(page) || 1,
-      reports,
+      reports: uniqueReports,
     });
   } catch (error) {
     console.error(`Error fetching 12-lead ECG list: ${error.message}`);
